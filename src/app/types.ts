@@ -39,6 +39,10 @@ export type ReferralRecord = {
   escalationCount?: number;
   escalationPausedAt?: Date;
   supportWorker?: string;
+  idPhotoPath?: string;
+  proofOfIncomePath?: string;
+  signaturePhotoPath?: string;
+  sdDocumentPaths?: string[];
   createdAt: Date;
 };
 
@@ -59,12 +63,39 @@ export type InspectionProblem = {
   description: string;
   photoCount: number;
   videoCount: number;
+  photoPaths?: string[];
+  videoPaths?: string[];
 };
 
 export type InspectionReport = {
   problems: InspectionProblem[];
   completedAt: Date;
   inspectorName?: string;
+  maintenanceRequested?: boolean;
+  maintenanceDescription?: string;
+  maintenancePhotoPaths?: string[];
+  maintenanceVideoPaths?: string[];
+  cleaningRequested?: boolean;
+  cleaningDescription?: string;
+  cleaningPhotoPaths?: string[];
+  cleaningVideoPaths?: string[];
+};
+
+export type CleaningStatus = "pending" | "assigned" | "completed";
+
+export type CleaningRequestSource = "inspector" | "maintenance";
+
+export type CleaningFields = {
+  cleaningStatus?: CleaningStatus;
+  cleaningRequestSource?: CleaningRequestSource;
+  cleaningRequestedAt?: Date;
+  cleaningAssignedAt?: Date;
+  cleaningCompletedAt?: Date;
+  cleaningDescription?: string;
+  cleaningPhotoPaths?: string[];
+  cleaningVideoPaths?: string[];
+  cleaningCompletionPhotoPaths?: string[];
+  cleaningCompletionVideoPaths?: string[];
 };
 
 export type LeaverRecord = {
@@ -80,6 +111,10 @@ export type LeaverRecord = {
   maintenanceWorksRequired: string;
   hasMaintenancePhotos: boolean;
   hasMaintenanceVideos: boolean;
+  maintenancePhotoPaths?: string[];
+  maintenanceVideoPaths?: string[];
+  inspectionPhotoPaths?: string[];
+  inspectionVideoPaths?: string[];
   assignedJobDate?: string;
   cleaningScheduledDate?: string;
   maintenanceScheduledDate?: string;
@@ -90,7 +125,7 @@ export type LeaverRecord = {
   assignedAt?: Date;
   escalationCount?: number;
   inspectionReport?: InspectionReport;
-};
+} & CleaningFields;
 
 export type TransferRecord = {
   id: number;
@@ -107,6 +142,10 @@ export type TransferRecord = {
   oldRoomMaintenanceWork: string;
   hasMaintenancePhotos: boolean;
   hasMaintenanceVideos: boolean;
+  maintenancePhotoPaths?: string[];
+  maintenanceVideoPaths?: string[];
+  inspectionPhotoPaths?: string[];
+  inspectionVideoPaths?: string[];
   assignedJobDate?: string;
   createdAt: Date;
   department?: string;
@@ -115,4 +154,4 @@ export type TransferRecord = {
   assignedAt?: Date;
   escalationCount?: number;
   inspectionReport?: InspectionReport;
-};
+} & CleaningFields;

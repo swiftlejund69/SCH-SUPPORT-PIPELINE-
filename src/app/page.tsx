@@ -12,13 +12,15 @@ import {
   receptionistOptions,
   referralOfficerOptions,
   referralOfficers,
-  securedReferralModules,
   supportWorkers,
   supportHistoryOptions,
   supportOptions,
   teamMembersByModule,
 } from "./data";
 import type {
+  CleaningFields,
+  CleaningRequestSource,
+  CleaningStatus,
   EligibilityResult,
   InspectionProblem,
   InspectionReport,
@@ -35,11 +37,16 @@ import {
 } from "./utils";
 import { BackButton } from "./components/BackButton";
 import { HistoryDetailPanel } from "./components/HistoryDetailPanel";
+import { LoginScreen } from "./components/LoginScreen";
 import { OptionCard } from "./components/OptionCard";
+import { RecordMediaGallery } from "./components/RecordMediaGallery";
+import { UsersAdmin } from "./components/UsersAdmin";
 import { goBack, goForward } from "./transitions";
 import { useCountUp } from "./useCountUp";
 import { useNowTick } from "./useNowTick";
 import { supabase } from "../lib/supabase";
+import { getCurrentProfile, type Profile } from "../lib/auth";
+import { uploadMany, uploadOne } from "../lib/storage";
 
 type SupabaseReferralRow = {
   app_record_id: number;
@@ -66,6 +73,10 @@ type SupabaseReferralRow = {
   hb_claims_status: string | null;
   rms_status: string | null;
   tenants_management_status: string | null;
+  id_photo_path: string | null;
+  proof_of_income_path: string | null;
+  signature_photo_path: string | null;
+  sd_document_paths: string[] | null;
   created_at: string;
 };
 
@@ -80,6 +91,27 @@ type StoredInspectionReport = {
   problems: StoredInspectionProblem[];
   completedAt: string;
   inspectorName?: string;
+  maintenanceRequested?: boolean;
+  maintenanceDescription?: string;
+  maintenancePhotoPaths?: string[];
+  maintenanceVideoPaths?: string[];
+  cleaningRequested?: boolean;
+  cleaningDescription?: string;
+  cleaningPhotoPaths?: string[];
+  cleaningVideoPaths?: string[];
+};
+
+type SupabaseCleaningColumns = {
+  cleaning_status: string | null;
+  cleaning_request_source: string | null;
+  cleaning_requested_at: string | null;
+  cleaning_assigned_at: string | null;
+  cleaning_completed_at: string | null;
+  cleaning_description: string | null;
+  cleaning_photo_paths: string[] | null;
+  cleaning_video_paths: string[] | null;
+  cleaning_completion_photo_paths: string[] | null;
+  cleaning_completion_video_paths: string[] | null;
 };
 
 type SupabaseLeaverRow = {
@@ -106,8 +138,12 @@ type SupabaseLeaverRow = {
   cleaning_scheduled_date: string | null;
   maintenance_scheduled_date: string | null;
   inspection_report: StoredInspectionReport | null;
+  maintenance_photo_paths: string[] | null;
+  maintenance_video_paths: string[] | null;
+  inspection_photo_paths: string[] | null;
+  inspection_video_paths: string[] | null;
   created_at: string;
-};
+} & Partial<SupabaseCleaningColumns>;
 
 type SupabaseTransferRow = {
   app_record_id: number;
@@ -135,15 +171,50 @@ type SupabaseTransferRow = {
   cleaning_scheduled_date: string | null;
   maintenance_scheduled_date: string | null;
   inspection_report: StoredInspectionReport | null;
+  maintenance_photo_paths: string[] | null;
+  maintenance_video_paths: string[] | null;
+  inspection_photo_paths: string[] | null;
+  inspection_video_paths: string[] | null;
   created_at: string;
-};
+} & Partial<SupabaseCleaningColumns>;
 
 function KpiNumber({ value }: { value: number }) {
   const animated = useCountUp(value);
   return <>{animated}</>;
 }
 
+type SdStage = "back-filling" | "viewing";
+type SdSlot = { code: string; name: string; stage: SdStage };
+const SD_SLOTS: readonly SdSlot[] = [
+  { code: "SD-1", name: "License agreement / dates & signatures", stage: "back-filling" },
+  { code: "SD-2", name: "Referral, risk assessment & GDPR form", stage: "back-filling" },
+  { code: "SD-3", name: "Missing person form", stage: "back-filling" },
+  { code: "SD-4", name: "Confidentiality form", stage: "back-filling" },
+  { code: "SD-5", name: "Authorisation form", stage: "back-filling" },
+  { code: "SD-6", name: "Fire evacuation", stage: "viewing" },
+  { code: "SD-7", name: "Fire safety induction form", stage: "viewing" },
+  { code: "SD-8", name: "Service charge form", stage: "back-filling" },
+  { code: "SD-9", name: "Resident rights form", stage: "back-filling" },
+  { code: "SD-10", name: "ID consent form", stage: "back-filling" },
+  { code: "SD-11", name: "Housing benefit application", stage: "back-filling" },
+  { code: "SD-12", name: "Proof of benefit with updated address", stage: "back-filling" },
+];
+const SD_SLOT_COUNT = SD_SLOTS.length;
+const BACK_FILLING_SLOT_INDICES: number[] = SD_SLOTS
+  .map((slot, index) => (slot.stage === "back-filling" ? index : -1))
+  .filter((index) => index !== -1);
+const VIEWING_SLOT_INDICES: number[] = SD_SLOTS
+  .map((slot, index) => (slot.stage === "viewing" ? index : -1))
+  .filter((index) => index !== -1);
+const SD_ACCEPT = "application/pdf,image/png,image/jpeg";
+
 export default function Home() {
+  const [currentProfile, setCurrentProfile] = useState<Profile | null>(null);
+  const [authReady, setAuthReady] = useState(false);
+  const [managerView, setManagerView] = useState<
+    "dashboard" | "users" | "team"
+  >("dashboard");
+  const [managerTeam, setManagerTeam] = useState<string | null>(null);
   const [selectedModule, setSelectedModule] = useState<string | null>(null);
   const [selectedReceptionAction, setSelectedReceptionAction] = useState<
     string | null
@@ -234,6 +305,78 @@ export default function Home() {
   >([]);
   const [maintenanceCompletionEvidence, setMaintenanceCompletionEvidence] =
     useState<Record<string, { hasPhotos: boolean; hasVideos: boolean }>>({});
+  const [maintenanceCompletionFiles, setMaintenanceCompletionFiles] = useState<
+    Record<string, { photos: File[]; videos: File[] }>
+  >({});
+  const [idPhotoFile, setIdPhotoFile] = useState<File | null>(null);
+  const [proofOfIncomeFile, setProofOfIncomeFile] = useState<File | null>(null);
+  const [signaturePhotoFiles, setSignaturePhotoFiles] = useState<
+    Record<number, File>
+  >({});
+  const [sdDocumentFiles, setSdDocumentFiles] = useState<
+    Record<number, (File | null)[]>
+  >({});
+  const [sdUploading, setSdUploading] = useState<Record<number, boolean>>({});
+  const [viewingSdFiles, setViewingSdFiles] = useState<
+    Record<number, (File | null)[]>
+  >({});
+  const [inspectionProblemFiles, setInspectionProblemFiles] = useState<
+    Record<number, { photos: File[]; videos: File[] }>
+  >({});
+  const [intakeUploading, setIntakeUploading] = useState(false);
+  const [signatureUploading, setSignatureUploading] = useState<
+    Record<number, boolean>
+  >({});
+  const [maintenanceUploading, setMaintenanceUploading] = useState<
+    Record<string, boolean>
+  >({});
+  const [inspectionUploading, setInspectionUploading] = useState(false);
+  const [
+    inspectionMaintenanceRequested,
+    setInspectionMaintenanceRequested,
+  ] = useState<boolean | null>(null);
+  const [
+    inspectionMaintenanceDescription,
+    setInspectionMaintenanceDescription,
+  ] = useState("");
+  const [inspectionMaintenancePhotos, setInspectionMaintenancePhotos] =
+    useState<File[]>([]);
+  const [inspectionMaintenanceVideos, setInspectionMaintenanceVideos] =
+    useState<File[]>([]);
+  const [inspectionCleaningRequested, setInspectionCleaningRequested] =
+    useState<boolean | null>(null);
+  const [inspectionCleaningDescription, setInspectionCleaningDescription] =
+    useState("");
+  const [inspectionCleaningPhotos, setInspectionCleaningPhotos] = useState<
+    File[]
+  >([]);
+  const [inspectionCleaningVideos, setInspectionCleaningVideos] = useState<
+    File[]
+  >([]);
+  const [cleanersPendingLeavers, setCleanersPendingLeavers] = useState<
+    LeaverRecord[]
+  >([]);
+  const [cleanersPendingTransfers, setCleanersPendingTransfers] = useState<
+    TransferRecord[]
+  >([]);
+  const [cleanersHistoryLeavers, setCleanersHistoryLeavers] = useState<
+    LeaverRecord[]
+  >([]);
+  const [cleanersHistoryTransfers, setCleanersHistoryTransfers] = useState<
+    TransferRecord[]
+  >([]);
+  const [cleaningCompletionFiles, setCleaningCompletionFiles] = useState<
+    Record<string, { photos: File[]; videos: File[] }>
+  >({});
+  const [cleaningCompletionEvidence, setCleaningCompletionEvidence] = useState<
+    Record<string, { hasPhotos: boolean; hasVideos: boolean }>
+  >({});
+  const [cleaningUploading, setCleaningUploading] = useState<
+    Record<string, boolean>
+  >({});
+  const [maintenanceNeedsCleaning, setMaintenanceNeedsCleaning] = useState<
+    Record<string, boolean | null>
+  >({});
   const [supportTransferHistory, setSupportTransferHistory] = useState<
     TransferRecord[]
   >([]);
@@ -392,6 +535,64 @@ export default function Home() {
   useEffect(() => {
     let isMounted = true;
 
+    async function refreshProfile() {
+      const profile = await getCurrentProfile();
+      if (!isMounted) {
+        return;
+      }
+      setCurrentProfile(profile);
+      if (profile && profile.role !== "Manager") {
+        setSelectedModule(profile.role);
+      }
+      setAuthReady(true);
+    }
+
+    void refreshProfile();
+
+    const { data } = supabase.auth.onAuthStateChange((event) => {
+      if (event === "SIGNED_OUT") {
+        setCurrentProfile(null);
+        setSelectedModule(null);
+        setManagerView("dashboard");
+        return;
+      }
+      if (event === "SIGNED_IN" || event === "TOKEN_REFRESHED") {
+        void refreshProfile();
+      }
+    });
+
+    return () => {
+      isMounted = false;
+      data.subscription.unsubscribe();
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!currentProfile) {
+      return;
+    }
+    if (currentProfile.role === "Manager") {
+      return;
+    }
+    if (selectedModule !== currentProfile.role) {
+      setSelectedModule(currentProfile.role);
+    }
+  }, [currentProfile, selectedModule]);
+
+  async function handleSignOut() {
+    await supabase.auth.signOut();
+    setCurrentProfile(null);
+    setSelectedModule(null);
+    setManagerView("dashboard");
+  }
+
+  useEffect(() => {
+    if (!currentProfile) {
+      return;
+    }
+
+    let isMounted = true;
+
     async function loadSavedRecords() {
       const [referralsResult, leaversResult, transfersResult] =
         await Promise.all([
@@ -445,7 +646,7 @@ export default function Home() {
     return () => {
       isMounted = false;
     };
-  }, []);
+  }, [currentProfile]);
 
   function resetReferralForm() {
     setReferralStep(1);
@@ -461,6 +662,8 @@ export default function Home() {
     setIncomeAmount("");
     setEditingFollowUpId(null);
     setEligibilityResult(null);
+    setIdPhotoFile(null);
+    setProofOfIncomeFile(null);
   }
 
   function resetLeaverForm() {
@@ -617,6 +820,14 @@ export default function Home() {
       };
     }
 
+    if (option === "Cleaners" && selectedModule === "Tenants Management") {
+      return {
+        alert: false,
+        count:
+          cleanersPendingLeavers.length + cleanersPendingTransfers.length,
+      };
+    }
+
     return { alert: false, count: 0 };
   }
 
@@ -687,6 +898,10 @@ export default function Home() {
       escalationPausedAt: record.escalation_paused_at
         ? new Date(record.escalation_paused_at)
         : undefined,
+      idPhotoPath: record.id_photo_path ?? undefined,
+      proofOfIncomePath: record.proof_of_income_path ?? undefined,
+      signaturePhotoPath: record.signature_photo_path ?? undefined,
+      sdDocumentPaths: record.sd_document_paths ?? undefined,
       createdAt: new Date(record.created_at),
     };
   }
@@ -701,6 +916,14 @@ export default function Home() {
       problems: stored.problems ?? [],
       completedAt: new Date(stored.completedAt),
       inspectorName: stored.inspectorName,
+      maintenanceRequested: stored.maintenanceRequested,
+      maintenanceDescription: stored.maintenanceDescription,
+      maintenancePhotoPaths: stored.maintenancePhotoPaths,
+      maintenanceVideoPaths: stored.maintenanceVideoPaths,
+      cleaningRequested: stored.cleaningRequested,
+      cleaningDescription: stored.cleaningDescription,
+      cleaningPhotoPaths: stored.cleaningPhotoPaths,
+      cleaningVideoPaths: stored.cleaningVideoPaths,
     };
   }
 
@@ -725,6 +948,62 @@ export default function Home() {
     return { summary, detail };
   }
 
+  function isCleaningStatus(value: unknown): value is CleaningStatus {
+    return value === "pending" || value === "assigned" || value === "completed";
+  }
+
+  function isCleaningSource(value: unknown): value is CleaningRequestSource {
+    return value === "inspector" || value === "maintenance";
+  }
+
+  function readCleaningFields(
+    record: Partial<SupabaseCleaningColumns>,
+  ): CleaningFields {
+    return {
+      cleaningStatus: isCleaningStatus(record.cleaning_status)
+        ? record.cleaning_status
+        : undefined,
+      cleaningRequestSource: isCleaningSource(record.cleaning_request_source)
+        ? record.cleaning_request_source
+        : undefined,
+      cleaningRequestedAt: record.cleaning_requested_at
+        ? new Date(record.cleaning_requested_at)
+        : undefined,
+      cleaningAssignedAt: record.cleaning_assigned_at
+        ? new Date(record.cleaning_assigned_at)
+        : undefined,
+      cleaningCompletedAt: record.cleaning_completed_at
+        ? new Date(record.cleaning_completed_at)
+        : undefined,
+      cleaningDescription: record.cleaning_description ?? undefined,
+      cleaningPhotoPaths: record.cleaning_photo_paths ?? undefined,
+      cleaningVideoPaths: record.cleaning_video_paths ?? undefined,
+      cleaningCompletionPhotoPaths:
+        record.cleaning_completion_photo_paths ?? undefined,
+      cleaningCompletionVideoPaths:
+        record.cleaning_completion_video_paths ?? undefined,
+    };
+  }
+
+  function writeCleaningFields(
+    fields: CleaningFields,
+  ): Partial<SupabaseCleaningColumns> {
+    return {
+      cleaning_status: fields.cleaningStatus ?? null,
+      cleaning_request_source: fields.cleaningRequestSource ?? null,
+      cleaning_requested_at: fields.cleaningRequestedAt?.toISOString() ?? null,
+      cleaning_assigned_at: fields.cleaningAssignedAt?.toISOString() ?? null,
+      cleaning_completed_at: fields.cleaningCompletedAt?.toISOString() ?? null,
+      cleaning_description: fields.cleaningDescription ?? null,
+      cleaning_photo_paths: fields.cleaningPhotoPaths ?? [],
+      cleaning_video_paths: fields.cleaningVideoPaths ?? [],
+      cleaning_completion_photo_paths:
+        fields.cleaningCompletionPhotoPaths ?? [],
+      cleaning_completion_video_paths:
+        fields.cleaningCompletionVideoPaths ?? [],
+    };
+  }
+
   function serialiseInspectionReport(
     report: InspectionReport | undefined,
   ): StoredInspectionReport | null {
@@ -735,6 +1014,14 @@ export default function Home() {
       problems: report.problems,
       completedAt: report.completedAt.toISOString(),
       inspectorName: report.inspectorName,
+      maintenanceRequested: report.maintenanceRequested,
+      maintenanceDescription: report.maintenanceDescription,
+      maintenancePhotoPaths: report.maintenancePhotoPaths,
+      maintenanceVideoPaths: report.maintenanceVideoPaths,
+      cleaningRequested: report.cleaningRequested,
+      cleaningDescription: report.cleaningDescription,
+      cleaningPhotoPaths: report.cleaningPhotoPaths,
+      cleaningVideoPaths: report.cleaningVideoPaths,
     };
   }
 
@@ -751,6 +1038,10 @@ export default function Home() {
       maintenanceWorksRequired: record.maintenance_works_required ?? "",
       hasMaintenancePhotos: record.has_maintenance_photos,
       hasMaintenanceVideos: record.has_maintenance_videos,
+      maintenancePhotoPaths: record.maintenance_photo_paths ?? undefined,
+      maintenanceVideoPaths: record.maintenance_video_paths ?? undefined,
+      inspectionPhotoPaths: record.inspection_photo_paths ?? undefined,
+      inspectionVideoPaths: record.inspection_video_paths ?? undefined,
       assignedJobDate: record.assigned_job_date ?? undefined,
       cleaningScheduledDate: record.cleaning_scheduled_date ?? undefined,
       maintenanceScheduledDate: record.maintenance_scheduled_date ?? undefined,
@@ -760,6 +1051,7 @@ export default function Home() {
       escalationCount: record.escalation_count ?? 0,
       inspectionReport: mapInspectionReport(record.inspection_report ?? null),
       createdAt: new Date(record.created_at),
+      ...readCleaningFields(record),
     };
   }
 
@@ -778,6 +1070,10 @@ export default function Home() {
       oldRoomMaintenanceWork: record.old_room_maintenance_work ?? "",
       hasMaintenancePhotos: record.has_maintenance_photos,
       hasMaintenanceVideos: record.has_maintenance_videos,
+      maintenancePhotoPaths: record.maintenance_photo_paths ?? undefined,
+      maintenanceVideoPaths: record.maintenance_video_paths ?? undefined,
+      inspectionPhotoPaths: record.inspection_photo_paths ?? undefined,
+      inspectionVideoPaths: record.inspection_video_paths ?? undefined,
       assignedJobDate: record.assigned_job_date ?? undefined,
       assignedTo: record.assigned_to ?? undefined,
       assignedBy: record.assigned_by ?? undefined,
@@ -785,6 +1081,7 @@ export default function Home() {
       escalationCount: record.escalation_count ?? 0,
       inspectionReport: mapInspectionReport(record.inspection_report ?? null),
       createdAt: new Date(record.created_at),
+      ...readCleaningFields(record),
     };
   }
 
@@ -811,19 +1108,43 @@ export default function Home() {
       }
 
       if (record.status === "secured") {
-        securedReferralModules.forEach((department) => {
-          const teamRecord = { ...record, department };
-          const savedStatus = getSavedDepartmentStatus(row, department);
+        const referralOfficerStatus = getSavedDepartmentStatus(
+          row,
+          "Referral Officer",
+        );
+        const referralOfficerTeamRecord = {
+          ...record,
+          department: "Referral Officer",
+        };
 
-          if (savedStatus) {
-            addRecordToMap(loadedTeamHistory, department, {
-              ...teamRecord,
-              teamOutcome: getTeamOutcomeFromSavedStatus(savedStatus),
-            });
-          } else {
-            addRecordToMap(loadedTeamQueues, department, teamRecord);
-          }
-        });
+        if (referralOfficerStatus) {
+          addRecordToMap(loadedTeamHistory, "Referral Officer", {
+            ...referralOfficerTeamRecord,
+            teamOutcome: getTeamOutcomeFromSavedStatus(referralOfficerStatus),
+          });
+
+          (["HB Claims Team", "RMS Team", "Tenants Management"] as const).forEach(
+            (department) => {
+              const teamRecord = { ...record, department };
+              const savedStatus = getSavedDepartmentStatus(row, department);
+
+              if (savedStatus) {
+                addRecordToMap(loadedTeamHistory, department, {
+                  ...teamRecord,
+                  teamOutcome: getTeamOutcomeFromSavedStatus(savedStatus),
+                });
+              } else {
+                addRecordToMap(loadedTeamQueues, department, teamRecord);
+              }
+            },
+          );
+        } else {
+          addRecordToMap(
+            loadedTeamQueues,
+            "Referral Officer",
+            referralOfficerTeamRecord,
+          );
+        }
       }
     });
 
@@ -841,6 +1162,8 @@ export default function Home() {
     const loadedMaintenancePending: LeaverRecord[] = [];
     const loadedInspectorQueue: LeaverRecord[] = [];
     const loadedInspectorHistory: LeaverRecord[] = [];
+    const loadedCleanersPending: LeaverRecord[] = [];
+    const loadedCleanersHistory: LeaverRecord[] = [];
 
     records.forEach((row) => {
       const record = mapLeaverRow(row);
@@ -864,6 +1187,12 @@ export default function Home() {
         loadedInspectorQueue.push(record);
       }
 
+      if (record.cleaningStatus === "pending" || record.cleaningStatus === "assigned") {
+        loadedCleanersPending.push(record);
+      } else if (record.cleaningStatus === "completed") {
+        loadedCleanersHistory.push(record);
+      }
+
       leaverTargetModules.forEach((department) => {
         const teamRecord = { ...record, department };
         const savedStatus = getSavedDepartmentStatus(row, department);
@@ -882,6 +1211,8 @@ export default function Home() {
     setMaintenancePendingLeavers(loadedMaintenancePending);
     setInspectorLeavers(loadedInspectorQueue);
     setInspectorHistory((current) => [...loadedInspectorHistory, ...current]);
+    setCleanersPendingLeavers(loadedCleanersPending);
+    setCleanersHistoryLeavers(loadedCleanersHistory);
   }
 
   function hydrateTransferRecords(records: SupabaseTransferRow[]) {
@@ -891,6 +1222,8 @@ export default function Home() {
     const loadedMaintenancePending: TransferRecord[] = [];
     const loadedInspectorQueue: TransferRecord[] = [];
     const loadedInspectorHistory: TransferRecord[] = [];
+    const loadedCleanersPending: TransferRecord[] = [];
+    const loadedCleanersHistory: TransferRecord[] = [];
 
     records.forEach((row) => {
       const record = mapTransferRow(row);
@@ -914,6 +1247,12 @@ export default function Home() {
         loadedInspectorQueue.push(record);
       }
 
+      if (record.cleaningStatus === "pending" || record.cleaningStatus === "assigned") {
+        loadedCleanersPending.push(record);
+      } else if (record.cleaningStatus === "completed") {
+        loadedCleanersHistory.push(record);
+      }
+
       leaverTargetModules.forEach((department) => {
         const teamRecord = { ...record, department };
         const savedStatus = getSavedDepartmentStatus(row, department);
@@ -932,6 +1271,8 @@ export default function Home() {
     setMaintenancePendingTransfers(loadedMaintenancePending);
     setInspectorTransfers(loadedInspectorQueue);
     setInspectorHistory((current) => [...loadedInspectorHistory, ...current]);
+    setCleanersPendingTransfers(loadedCleanersPending);
+    setCleanersHistoryTransfers(loadedCleanersHistory);
   }
 
   function createReferralRecord(
@@ -1012,6 +1353,10 @@ export default function Home() {
         assigned_at: record.assignedAt?.toISOString() ?? null,
         escalation_count: record.escalationCount ?? 0,
         escalation_paused_at: record.escalationPausedAt?.toISOString() ?? null,
+        id_photo_path: record.idPhotoPath ?? null,
+        proof_of_income_path: record.proofOfIncomePath ?? null,
+        signature_photo_path: record.signaturePhotoPath ?? null,
+        sd_document_paths: record.sdDocumentPaths ?? null,
         monday_item_id: record.mondayItemId || null,
       },
       { onConflict: "app_record_id" },
@@ -1042,6 +1387,10 @@ export default function Home() {
         cleaning_type: record.cleaningType || null,
         has_maintenance_photos: record.hasMaintenancePhotos,
         has_maintenance_videos: record.hasMaintenanceVideos,
+        maintenance_photo_paths: record.maintenancePhotoPaths ?? [],
+        maintenance_video_paths: record.maintenanceVideoPaths ?? [],
+        inspection_photo_paths: record.inspectionPhotoPaths ?? [],
+        inspection_video_paths: record.inspectionVideoPaths ?? [],
         assigned_job_date: record.assignedJobDate || null,
         assigned_to: record.assignedTo || null,
         assigned_by: record.assignedBy || null,
@@ -1049,6 +1398,7 @@ export default function Home() {
         escalation_count: record.escalationCount ?? 0,
         inspection_report: serialiseInspectionReport(record.inspectionReport),
         monday_item_id: record.mondayItemId || null,
+        ...writeCleaningFields(record),
       },
       { onConflict: "app_record_id" },
     );
@@ -1080,6 +1430,10 @@ export default function Home() {
         cleaning_type: record.cleaningType || null,
         has_maintenance_photos: record.hasMaintenancePhotos,
         has_maintenance_videos: record.hasMaintenanceVideos,
+        maintenance_photo_paths: record.maintenancePhotoPaths ?? [],
+        maintenance_video_paths: record.maintenanceVideoPaths ?? [],
+        inspection_photo_paths: record.inspectionPhotoPaths ?? [],
+        inspection_video_paths: record.inspectionVideoPaths ?? [],
         assigned_job_date: record.assignedJobDate || null,
         assigned_to: record.assignedTo || null,
         assigned_by: record.assignedBy || null,
@@ -1087,6 +1441,7 @@ export default function Home() {
         escalation_count: record.escalationCount ?? 0,
         inspection_report: serialiseInspectionReport(record.inspectionReport),
         monday_item_id: record.mondayItemId || null,
+        ...writeCleaningFields(record),
       },
       { onConflict: "app_record_id" },
     );
@@ -1274,9 +1629,6 @@ export default function Home() {
     record: ReferralRecord,
     status: "secured" | "viewing-ended",
   ) {
-    setDriverQueue((records) =>
-      records.filter((driverRecord) => driverRecord.id !== record.id),
-    );
     let completedRecord: ReferralRecord = {
       ...record,
       status,
@@ -1287,6 +1639,94 @@ export default function Home() {
     };
 
     if (status === "secured") {
+      const signatureFile = signaturePhotoFiles[record.id];
+      if (signatureFile) {
+        setSignatureUploading((current) => ({ ...current, [record.id]: true }));
+        try {
+          const path = await uploadOne(
+            "referral-documents",
+            ["referrals", record.id, "signature"],
+            signatureFile,
+          );
+          completedRecord = { ...completedRecord, signaturePhotoPath: path };
+        } catch (error) {
+          console.error("Could not upload signature photo", error);
+          toast.error("Could not upload signature photo", {
+            description:
+              error instanceof Error ? error.message : "Please try again.",
+          });
+          setSignatureUploading((current) => {
+            const next = { ...current };
+            delete next[record.id];
+            return next;
+          });
+          return;
+        }
+        setSignatureUploading((current) => {
+          const next = { ...current };
+          delete next[record.id];
+          return next;
+        });
+        setSignaturePhotoFiles((current) => {
+          const next = { ...current };
+          delete next[record.id];
+          return next;
+        });
+      }
+
+      const viewingFiles = viewingSdFiles[record.id] ?? [];
+      const missingViewing = VIEWING_SLOT_INDICES.filter(
+        (_, viewingIndex) => !viewingFiles[viewingIndex],
+      );
+      if (missingViewing.length > 0) {
+        toast.error("Missing viewing documents", {
+          description: `Please upload ${missingViewing
+            .map((slotIndex) => SD_SLOTS[slotIndex].code)
+            .join(" and ")} before finishing.`,
+        });
+        return;
+      }
+
+      try {
+        const baseSdPaths: string[] = [];
+        const existing = completedRecord.sdDocumentPaths ?? [];
+        for (let i = 0; i < SD_SLOT_COUNT; i++) {
+          baseSdPaths.push(existing[i] ?? "");
+        }
+        for (
+          let viewingIndex = 0;
+          viewingIndex < VIEWING_SLOT_INDICES.length;
+          viewingIndex++
+        ) {
+          const slotIndex = VIEWING_SLOT_INDICES[viewingIndex];
+          const file = viewingFiles[viewingIndex];
+          if (file) {
+            const path = await uploadOne(
+              "sd-documents",
+              ["referral", record.id, SD_SLOTS[slotIndex].code],
+              file,
+            );
+            baseSdPaths[slotIndex] = path;
+          }
+        }
+        completedRecord = {
+          ...completedRecord,
+          sdDocumentPaths: baseSdPaths,
+        };
+        setViewingSdFiles((current) => {
+          const next = { ...current };
+          delete next[record.id];
+          return next;
+        });
+      } catch (error) {
+        console.error("Could not upload viewing SD documents", error);
+        toast.error("Could not upload viewing documents", {
+          description:
+            error instanceof Error ? error.message : "Please try again.",
+        });
+        return;
+      }
+
       const mondayItemId = await createMondayItem(
         "create-referral",
         completedRecord,
@@ -1298,25 +1738,23 @@ export default function Home() {
       };
     }
 
+    setDriverQueue((records) =>
+      records.filter((driverRecord) => driverRecord.id !== record.id),
+    );
     setHistory((records) => [completedRecord, ...records]);
     void saveReferralRecord(completedRecord);
 
     if (status === "secured") {
-      setTeamNewReferrals((queues) => {
-        const nextQueues = { ...queues };
-
-        securedReferralModules.forEach((module) => {
-          nextQueues[module] = [
-            {
-              ...completedRecord,
-              department: module,
-            },
-            ...(nextQueues[module] ?? []),
-          ];
-        });
-
-        return nextQueues;
-      });
+      setTeamNewReferrals((queues) => ({
+        ...queues,
+        "Referral Officer": [
+          {
+            ...completedRecord,
+            department: "Referral Officer",
+          },
+          ...(queues["Referral Officer"] ?? []),
+        ],
+      }));
     }
   }
 
@@ -1711,6 +2149,184 @@ export default function Home() {
     }));
   }
 
+  function setMaintenanceFiles(
+    type: "leaver" | "transfer",
+    id: number,
+    kind: "photos" | "videos",
+    files: File[],
+  ) {
+    const key = getMaintenanceEvidenceKey(type, id);
+    setMaintenanceCompletionFiles((current) => ({
+      ...current,
+      [key]: {
+        photos: current[key]?.photos ?? [],
+        videos: current[key]?.videos ?? [],
+        [kind]: files,
+      },
+    }));
+    updateMaintenanceEvidence(type, id, {
+      [kind === "photos" ? "hasPhotos" : "hasVideos"]: files.length > 0,
+    });
+  }
+
+  function setInspectionFiles(
+    problemId: number,
+    kind: "photos" | "videos",
+    incoming: File[],
+  ) {
+    setInspectionProblemFiles((current) => {
+      const existing = current[problemId] ?? { photos: [], videos: [] };
+      return {
+        ...current,
+        [problemId]: {
+          ...existing,
+          [kind]: [...existing[kind], ...incoming],
+        },
+      };
+    });
+  }
+
+  function clearMaintenanceFiles(type: "leaver" | "transfer", id: number) {
+    const key = getMaintenanceEvidenceKey(type, id);
+    setMaintenanceCompletionFiles((current) => {
+      const next = { ...current };
+      delete next[key];
+      return next;
+    });
+  }
+
+  function getCleaningKey(type: "leaver" | "transfer", id: number) {
+    return `cleaning-${type}-${id}`;
+  }
+
+  function updateCleaningEvidence(
+    type: "leaver" | "transfer",
+    id: number,
+    updates: Partial<{ hasPhotos: boolean; hasVideos: boolean }>,
+  ) {
+    const key = getCleaningKey(type, id);
+    setCleaningCompletionEvidence((current) => ({
+      ...current,
+      [key]: {
+        hasPhotos: current[key]?.hasPhotos ?? false,
+        hasVideos: current[key]?.hasVideos ?? false,
+        ...updates,
+      },
+    }));
+  }
+
+  function setCleaningFiles(
+    type: "leaver" | "transfer",
+    id: number,
+    kind: "photos" | "videos",
+    files: File[],
+  ) {
+    const key = getCleaningKey(type, id);
+    setCleaningCompletionFiles((current) => ({
+      ...current,
+      [key]: {
+        photos: current[key]?.photos ?? [],
+        videos: current[key]?.videos ?? [],
+        [kind]: files,
+      },
+    }));
+    updateCleaningEvidence(type, id, {
+      [kind === "photos" ? "hasPhotos" : "hasVideos"]: files.length > 0,
+    });
+  }
+
+  function clearCleaningFiles(type: "leaver" | "transfer", id: number) {
+    const key = getCleaningKey(type, id);
+    setCleaningCompletionFiles((current) => {
+      const next = { ...current };
+      delete next[key];
+      return next;
+    });
+    setCleaningCompletionEvidence((current) => {
+      const next = { ...current };
+      delete next[key];
+      return next;
+    });
+  }
+
+  async function completeCleaningJob(
+    record: LeaverRecord | TransferRecord,
+    type: "leaver" | "transfer",
+  ) {
+    const key = getCleaningKey(type, record.id);
+    const evidence = cleaningCompletionEvidence[key];
+    if (!evidence?.hasPhotos || !evidence?.hasVideos) {
+      toast.error("Attach completion media", {
+        description:
+          "Add at least one photo and one video showing the cleaning is done.",
+      });
+      return;
+    }
+    setCleaningUploading((current) => ({ ...current, [key]: true }));
+    try {
+      const files = cleaningCompletionFiles[key];
+      const recordType = type === "leaver" ? "leavers" : "transfers";
+      const photoPaths = files?.photos.length
+        ? await uploadMany(
+            "maintenance-media",
+            [recordType, record.id, "cleaning", "completion", "photos"],
+            files.photos,
+          )
+        : [];
+      const videoPaths = files?.videos.length
+        ? await uploadMany(
+            "maintenance-media",
+            [recordType, record.id, "cleaning", "completion", "videos"],
+            files.videos,
+          )
+        : [];
+      const completed = {
+        ...record,
+        cleaningStatus: "completed" as CleaningStatus,
+        cleaningCompletedAt: new Date(),
+        cleaningCompletionPhotoPaths: [
+          ...(record.cleaningCompletionPhotoPaths ?? []),
+          ...photoPaths,
+        ],
+        cleaningCompletionVideoPaths: [
+          ...(record.cleaningCompletionVideoPaths ?? []),
+          ...videoPaths,
+        ],
+      };
+      if (type === "leaver") {
+        const leaverDone = completed as LeaverRecord;
+        setCleanersPendingLeavers((records) =>
+          records.filter((item) => item.id !== record.id),
+        );
+        setCleanersHistoryLeavers((records) => [leaverDone, ...records]);
+        await saveLeaverRecord(leaverDone);
+      } else {
+        const transferDone = completed as TransferRecord;
+        setCleanersPendingTransfers((records) =>
+          records.filter((item) => item.id !== record.id),
+        );
+        setCleanersHistoryTransfers((records) => [transferDone, ...records]);
+        await saveTransferRecord(transferDone);
+      }
+      clearCleaningFiles(type, record.id);
+      toast.success("Cleaning marked as done", {
+        description: inspectionPropertyAddress(record),
+      });
+    } catch (error) {
+      console.error("Could not complete cleaning job", error);
+      toast.error("Could not complete cleaning job", {
+        description:
+          error instanceof Error ? error.message : "Please try again.",
+      });
+    } finally {
+      setCleaningUploading((current) => {
+        const next = { ...current };
+        delete next[key];
+        return next;
+      });
+    }
+  }
+
   function matchesBoardSearch(
     key: string,
     ...parts: Array<string | number | null | undefined>
@@ -1804,7 +2420,157 @@ export default function Home() {
     return "name" in record ? record.name : record.fullName;
   }
 
-  function completeTeamReferral(
+  function getRecordMediaItems(
+    record:
+      | ReferralRecord
+      | TeamReferralRecord
+      | LeaverRecord
+      | TransferRecord,
+    viewerModule?: string | null,
+  ) {
+    const items: Array<{
+      bucket: "referral-documents" | "maintenance-media" | "sd-documents";
+      path: string;
+      kind: "photo" | "video";
+      label?: string;
+    }> = [];
+
+    if ("idPhotoPath" in record && record.idPhotoPath) {
+      items.push({
+        bucket: "referral-documents",
+        path: record.idPhotoPath,
+        kind: "photo",
+        label: "SD-10.1 Tenant ID",
+      });
+    }
+    if ("proofOfIncomePath" in record && record.proofOfIncomePath) {
+      items.push({
+        bucket: "referral-documents",
+        path: record.proofOfIncomePath,
+        kind: "photo",
+        label: "Proof of income",
+      });
+    }
+    if ("signaturePhotoPath" in record && record.signaturePhotoPath) {
+      items.push({
+        bucket: "referral-documents",
+        path: record.signaturePhotoPath,
+        kind: "photo",
+        label: "Signed viewing form",
+      });
+    }
+
+    if (
+      "sdDocumentPaths" in record &&
+      record.sdDocumentPaths &&
+      (viewerModule === "HB Claims Team" || viewerModule === "RMS Team")
+    ) {
+      record.sdDocumentPaths.forEach((path, index) => {
+        if (path) {
+          const slot = SD_SLOTS[index];
+          const label = slot
+            ? `${slot.code} ${slot.name}`
+            : `SD-${index + 1}`;
+          items.push({
+            bucket: "sd-documents",
+            path,
+            kind: "photo",
+            label,
+          });
+        }
+      });
+    }
+    if ("maintenancePhotoPaths" in record && record.maintenancePhotoPaths) {
+      record.maintenancePhotoPaths.forEach((path, index) =>
+        items.push({
+          bucket: "maintenance-media",
+          path,
+          kind: "photo",
+          label: `Maintenance photo ${index + 1}`,
+        }),
+      );
+    }
+    if ("maintenanceVideoPaths" in record && record.maintenanceVideoPaths) {
+      record.maintenanceVideoPaths.forEach((path, index) =>
+        items.push({
+          bucket: "maintenance-media",
+          path,
+          kind: "video",
+          label: `Maintenance video ${index + 1}`,
+        }),
+      );
+    }
+    if ("inspectionPhotoPaths" in record && record.inspectionPhotoPaths) {
+      record.inspectionPhotoPaths.forEach((path, index) =>
+        items.push({
+          bucket: "maintenance-media",
+          path,
+          kind: "photo",
+          label: `Inspection photo ${index + 1}`,
+        }),
+      );
+    }
+    if ("inspectionVideoPaths" in record && record.inspectionVideoPaths) {
+      record.inspectionVideoPaths.forEach((path, index) =>
+        items.push({
+          bucket: "maintenance-media",
+          path,
+          kind: "video",
+          label: `Inspection video ${index + 1}`,
+        }),
+      );
+    }
+    if ("cleaningPhotoPaths" in record && record.cleaningPhotoPaths) {
+      record.cleaningPhotoPaths.forEach((path, index) =>
+        items.push({
+          bucket: "maintenance-media",
+          path,
+          kind: "photo",
+          label: `Cleaning brief photo ${index + 1}`,
+        }),
+      );
+    }
+    if ("cleaningVideoPaths" in record && record.cleaningVideoPaths) {
+      record.cleaningVideoPaths.forEach((path, index) =>
+        items.push({
+          bucket: "maintenance-media",
+          path,
+          kind: "video",
+          label: `Cleaning brief video ${index + 1}`,
+        }),
+      );
+    }
+    if (
+      "cleaningCompletionPhotoPaths" in record &&
+      record.cleaningCompletionPhotoPaths
+    ) {
+      record.cleaningCompletionPhotoPaths.forEach((path, index) =>
+        items.push({
+          bucket: "maintenance-media",
+          path,
+          kind: "photo",
+          label: `Cleaning done photo ${index + 1}`,
+        }),
+      );
+    }
+    if (
+      "cleaningCompletionVideoPaths" in record &&
+      record.cleaningCompletionVideoPaths
+    ) {
+      record.cleaningCompletionVideoPaths.forEach((path, index) =>
+        items.push({
+          bucket: "maintenance-media",
+          path,
+          kind: "video",
+          label: `Cleaning done video ${index + 1}`,
+        }),
+      );
+    }
+
+    return items;
+  }
+
+  async function completeTeamReferral(
     department: string,
     record: TeamReferralRecord,
     outcome: TeamReferralRecord["teamOutcome"],
@@ -1819,8 +2585,63 @@ export default function Home() {
       return;
     }
 
+    let workingRecord: TeamReferralRecord = record;
+
+    if (department === "Referral Officer" && outcome === "uploaded") {
+      const savedPaths = record.sdDocumentPaths ?? [];
+      const picked = sdDocumentFiles[record.id] ?? [];
+      const missing = BACK_FILLING_SLOT_INDICES.filter(
+        (slotIndex) => !(picked[slotIndex] || savedPaths[slotIndex]),
+      );
+      if (missing.length > 0) {
+        toast.error("Missing SD documents", {
+          description: `Please upload: ${missing
+            .map((slotIndex) => SD_SLOTS[slotIndex].code)
+            .join(", ")}`,
+        });
+        return;
+      }
+
+      setSdUploading((prev) => ({ ...prev, [record.id]: true }));
+      try {
+        const mergedPaths: string[] = [];
+        for (let i = 0; i < SD_SLOT_COUNT; i++) {
+          const fresh = picked[i];
+          if (fresh) {
+            const path = await uploadOne(
+              "sd-documents",
+              ["referral", record.id, SD_SLOTS[i].code],
+              fresh,
+            );
+            mergedPaths.push(path);
+          } else {
+            mergedPaths.push(savedPaths[i] ?? "");
+          }
+        }
+        workingRecord = {
+          ...record,
+          sdDocumentPaths: mergedPaths,
+        };
+        await saveReferralRecord(workingRecord);
+        setSdDocumentFiles((prev) => {
+          const next = { ...prev };
+          delete next[record.id];
+          return next;
+        });
+      } catch (uploadError) {
+        const message =
+          uploadError instanceof Error
+            ? uploadError.message
+            : String(uploadError);
+        toast.error("Could not upload SD documents", { description: message });
+        setSdUploading((prev) => ({ ...prev, [record.id]: false }));
+        return;
+      }
+      setSdUploading((prev) => ({ ...prev, [record.id]: false }));
+    }
+
     const completedRecord: TeamReferralRecord = {
-      ...record,
+      ...workingRecord,
       teamOutcome: outcome,
       teamRejectionReason: outcome === "uploaded" ? "" : rejectionReason,
       escalationPausedAt:
@@ -1848,6 +2669,32 @@ export default function Home() {
         [department]: [completedRecord, ...(records[department] ?? [])],
       }));
       setSelectedHistoryDetail(null);
+    }
+
+    if (department === "Referral Officer" && outcome === "uploaded") {
+      setTeamNewReferrals((queues) => {
+        const next = { ...queues };
+        (["HB Claims Team", "RMS Team", "Tenants Management"] as const).forEach(
+          (team) => {
+            next[team] = [
+              {
+                ...workingRecord,
+                department: team,
+                teamOutcome: undefined,
+                teamRejectionReason: undefined,
+                handledAt: undefined,
+                assignedTo: undefined,
+                assignedBy: undefined,
+                assignedAt: undefined,
+                escalationCount: 0,
+                escalationPausedAt: undefined,
+              },
+              ...(next[team] ?? []),
+            ];
+          },
+        );
+        return next;
+      });
     }
 
     void updateSupabaseTeamStatus("referrals", record.id, department, outcome);
@@ -2078,7 +2925,7 @@ export default function Home() {
     );
   }
 
-  function completeMaintenancePendingJob(
+  async function completeMaintenancePendingJob(
     record: LeaverRecord | TransferRecord,
     type: "leaver" | "transfer",
   ) {
@@ -2088,11 +2935,96 @@ export default function Home() {
       return;
     }
 
+    const needsCleaningAnswer = maintenanceNeedsCleaning[evidenceKey];
+    if (needsCleaningAnswer === undefined || needsCleaningAnswer === null) {
+      toast.error("Answer the cleaning question", {
+        description: "Tell us whether this site needs cleaning afterwards.",
+      });
+      return;
+    }
+
+    const files = maintenanceCompletionFiles[evidenceKey];
+    const existingPhotos = record.maintenancePhotoPaths ?? [];
+    const existingVideos = record.maintenanceVideoPaths ?? [];
+
+    setMaintenanceUploading((current) => ({ ...current, [evidenceKey]: true }));
+
+    let uploadedPhotos: string[] = [];
+    let uploadedVideos: string[] = [];
+
+    try {
+      if (files?.photos.length) {
+        uploadedPhotos = await uploadMany(
+          "maintenance-media",
+          [type === "leaver" ? "leavers" : "transfers", record.id, "photos"],
+          files.photos,
+        );
+      }
+      if (files?.videos.length) {
+        uploadedVideos = await uploadMany(
+          "maintenance-media",
+          [type === "leaver" ? "leavers" : "transfers", record.id, "videos"],
+          files.videos,
+        );
+      }
+    } catch (error) {
+      console.error("Could not upload maintenance media", error);
+      toast.error("Could not upload completion media", {
+        description:
+          error instanceof Error ? error.message : "Please try again.",
+      });
+      setMaintenanceUploading((current) => {
+        const next = { ...current };
+        delete next[evidenceKey];
+        return next;
+      });
+      return;
+    }
+
+    setMaintenanceUploading((current) => {
+      const next = { ...current };
+      delete next[evidenceKey];
+      return next;
+    });
+
+    const allPhotos = [...existingPhotos, ...uploadedPhotos];
+    const allVideos = [...existingVideos, ...uploadedVideos];
+
+    const cleaningHandoff: CleaningFields = needsCleaningAnswer
+      ? {
+          cleaningStatus: "pending",
+          cleaningRequestSource: "maintenance",
+          cleaningRequestedAt: new Date(),
+          cleaningDescription:
+            record.cleaningDescription ??
+            ("propertyAddress" in record
+              ? `Cleaning needed after maintenance at ${record.propertyAddress} room ${record.roomNumber}.`
+              : `Cleaning needed after maintenance at ${(record as TransferRecord).currentProperty} room ${(record as TransferRecord).currentRoomNumber}.`),
+          cleaningPhotoPaths: [
+            ...(record.cleaningPhotoPaths ?? []),
+            ...uploadedPhotos,
+          ],
+          cleaningVideoPaths: [
+            ...(record.cleaningVideoPaths ?? []),
+            ...uploadedVideos,
+          ],
+        }
+      : {};
+
+    setMaintenanceNeedsCleaning((current) => {
+      const next = { ...current };
+      delete next[evidenceKey];
+      return next;
+    });
+
     if (type === "leaver" && "propertyAddress" in record) {
       const completedRecord: LeaverRecord = {
         ...record,
-        hasMaintenancePhotos: true,
-        hasMaintenanceVideos: true,
+        hasMaintenancePhotos: allPhotos.length > 0,
+        hasMaintenanceVideos: allVideos.length > 0,
+        maintenancePhotoPaths: allPhotos,
+        maintenanceVideoPaths: allVideos,
+        ...cleaningHandoff,
       };
       setMaintenancePendingLeavers((records) =>
         records.filter((item) => item.id !== record.id),
@@ -2104,11 +3036,15 @@ export default function Home() {
           ...(queues["Maintenance Team"] ?? []),
         ],
       }));
+      if (needsCleaningAnswer) {
+        setCleanersPendingLeavers((records) => [completedRecord, ...records]);
+      }
       setMaintenanceCompletionEvidence((current) => {
         const next = { ...current };
         delete next[evidenceKey];
         return next;
       });
+      clearMaintenanceFiles(type, record.id);
       void updateSupabaseTeamStatus(
         "leavers",
         record.id,
@@ -2122,14 +3058,25 @@ export default function Home() {
         "completed",
       );
       void saveLeaverRecord(completedRecord);
+      toast.success(
+        needsCleaningAnswer ? "Sent to Cleaners" : "Job marked done",
+        {
+          description: needsCleaningAnswer
+            ? `${record.propertyAddress} now waiting on cleaning.`
+            : `${record.propertyAddress} is ready.`,
+        },
+      );
       return;
     }
 
     if (type === "transfer" && "currentProperty" in record) {
       const completedRecord: TransferRecord = {
         ...record,
-        hasMaintenancePhotos: true,
-        hasMaintenanceVideos: true,
+        hasMaintenancePhotos: allPhotos.length > 0,
+        hasMaintenanceVideos: allVideos.length > 0,
+        maintenancePhotoPaths: allPhotos,
+        maintenanceVideoPaths: allVideos,
+        ...cleaningHandoff,
       };
       setMaintenancePendingTransfers((records) =>
         records.filter((item) => item.id !== record.id),
@@ -2141,11 +3088,18 @@ export default function Home() {
           ...(queues["Maintenance Team"] ?? []),
         ],
       }));
+      if (needsCleaningAnswer) {
+        setCleanersPendingTransfers((records) => [
+          completedRecord,
+          ...records,
+        ]);
+      }
       setMaintenanceCompletionEvidence((current) => {
         const next = { ...current };
         delete next[evidenceKey];
         return next;
       });
+      clearMaintenanceFiles(type, record.id);
       void updateSupabaseTeamStatus(
         "transfers",
         record.id,
@@ -2159,6 +3113,14 @@ export default function Home() {
         "completed",
       );
       void saveTransferRecord(completedRecord);
+      toast.success(
+        needsCleaningAnswer ? "Sent to Cleaners" : "Job marked done",
+        {
+          description: needsCleaningAnswer
+            ? `${record.currentProperty} now waiting on cleaning.`
+            : `${record.currentProperty} is ready.`,
+        },
+      );
     }
   }
 
@@ -2180,16 +3142,31 @@ export default function Home() {
     return isLeaverRecord(record) ? record.roomNumber : record.currentRoomNumber;
   }
 
+  function resetInspectionSummary() {
+    setInspectionMaintenanceRequested(null);
+    setInspectionMaintenanceDescription("");
+    setInspectionMaintenancePhotos([]);
+    setInspectionMaintenanceVideos([]);
+    setInspectionCleaningRequested(null);
+    setInspectionCleaningDescription("");
+    setInspectionCleaningPhotos([]);
+    setInspectionCleaningVideos([]);
+  }
+
   function openInspectionForm(record: LeaverRecord | TransferRecord) {
     setSelectedInspectionTarget(record);
     setInspectionDraft([
       { id: Date.now(), description: "", photoCount: 0, videoCount: 0 },
     ]);
+    setInspectionProblemFiles({});
+    resetInspectionSummary();
   }
 
   function closeInspectionForm() {
     setSelectedInspectionTarget(null);
     setInspectionDraft([]);
+    setInspectionProblemFiles({});
+    resetInspectionSummary();
   }
 
   function addInspectionProblem() {
@@ -2214,9 +3191,14 @@ export default function Home() {
     setInspectionDraft((problems) =>
       problems.filter((problem) => problem.id !== id),
     );
+    setInspectionProblemFiles((current) => {
+      const next = { ...current };
+      delete next[id];
+      return next;
+    });
   }
 
-  function completeInspection(record: LeaverRecord | TransferRecord) {
+  async function completeInspection(record: LeaverRecord | TransferRecord) {
     const cleanProblems = inspectionDraft.filter(
       (problem) => problem.description.trim().length > 0,
     );
@@ -2227,49 +3209,272 @@ export default function Home() {
       return;
     }
 
+    if (inspectionMaintenanceRequested === null) {
+      toast.error("Answer the maintenance question", {
+        description: "Tell us whether this property needs maintenance work.",
+      });
+      return;
+    }
+    if (inspectionCleaningRequested === null) {
+      toast.error("Answer the cleaning question", {
+        description: "Tell us whether this property needs cleaning.",
+      });
+      return;
+    }
+    if (
+      inspectionMaintenanceRequested &&
+      inspectionMaintenanceDescription.trim().length === 0
+    ) {
+      toast.error("Describe the maintenance work needed", {
+        description: "A short description is required for the maintenance job.",
+      });
+      return;
+    }
+    if (
+      inspectionCleaningRequested &&
+      inspectionCleaningDescription.trim().length === 0
+    ) {
+      toast.error("Describe the cleaning needed", {
+        description: "A short description is required for the cleaning job.",
+      });
+      return;
+    }
+
+    setInspectionUploading(true);
+
+    const recordType = isLeaverRecord(record) ? "leavers" : "transfers";
+    const enrichedProblems: InspectionProblem[] = [];
+    const allPhotoPaths: string[] = [];
+    const allVideoPaths: string[] = [];
+
+    let maintenanceSummaryPhotos: string[] = [];
+    let maintenanceSummaryVideos: string[] = [];
+    let cleaningSummaryPhotos: string[] = [];
+    let cleaningSummaryVideos: string[] = [];
+
+    try {
+      for (const problem of cleanProblems) {
+        const files = inspectionProblemFiles[problem.id];
+        const photoPaths = files?.photos.length
+          ? await uploadMany(
+              "maintenance-media",
+              [recordType, record.id, "inspection", problem.id, "photos"],
+              files.photos,
+            )
+          : [];
+        const videoPaths = files?.videos.length
+          ? await uploadMany(
+              "maintenance-media",
+              [recordType, record.id, "inspection", problem.id, "videos"],
+              files.videos,
+            )
+          : [];
+
+        enrichedProblems.push({
+          ...problem,
+          photoPaths,
+          videoPaths,
+        });
+        allPhotoPaths.push(...photoPaths);
+        allVideoPaths.push(...videoPaths);
+      }
+
+      if (inspectionMaintenanceRequested) {
+        maintenanceSummaryPhotos = inspectionMaintenancePhotos.length
+          ? await uploadMany(
+              "maintenance-media",
+              [recordType, record.id, "inspection", "summary-maintenance", "photos"],
+              inspectionMaintenancePhotos,
+            )
+          : [];
+        maintenanceSummaryVideos = inspectionMaintenanceVideos.length
+          ? await uploadMany(
+              "maintenance-media",
+              [recordType, record.id, "inspection", "summary-maintenance", "videos"],
+              inspectionMaintenanceVideos,
+            )
+          : [];
+      }
+      if (inspectionCleaningRequested) {
+        cleaningSummaryPhotos = inspectionCleaningPhotos.length
+          ? await uploadMany(
+              "maintenance-media",
+              [recordType, record.id, "inspection", "summary-cleaning", "photos"],
+              inspectionCleaningPhotos,
+            )
+          : [];
+        cleaningSummaryVideos = inspectionCleaningVideos.length
+          ? await uploadMany(
+              "maintenance-media",
+              [recordType, record.id, "inspection", "summary-cleaning", "videos"],
+              inspectionCleaningVideos,
+            )
+          : [];
+      }
+    } catch (error) {
+      console.error("Could not upload inspection media", error);
+      toast.error("Could not upload inspection media", {
+        description:
+          error instanceof Error ? error.message : "Please try again.",
+      });
+      setInspectionUploading(false);
+      return;
+    }
+
+    setInspectionUploading(false);
+
     const report: InspectionReport = {
-      problems: cleanProblems,
+      problems: enrichedProblems,
       completedAt: new Date(),
       inspectorName,
+      maintenanceRequested: inspectionMaintenanceRequested,
+      maintenanceDescription: inspectionMaintenanceRequested
+        ? inspectionMaintenanceDescription.trim()
+        : undefined,
+      maintenancePhotoPaths: inspectionMaintenanceRequested
+        ? maintenanceSummaryPhotos
+        : undefined,
+      maintenanceVideoPaths: inspectionMaintenanceRequested
+        ? maintenanceSummaryVideos
+        : undefined,
+      cleaningRequested: inspectionCleaningRequested,
+      cleaningDescription: inspectionCleaningRequested
+        ? inspectionCleaningDescription.trim()
+        : undefined,
+      cleaningPhotoPaths: inspectionCleaningRequested
+        ? cleaningSummaryPhotos
+        : undefined,
+      cleaningVideoPaths: inspectionCleaningRequested
+        ? cleaningSummaryVideos
+        : undefined,
     };
 
+    const cleaningStamp: CleaningFields = inspectionCleaningRequested
+      ? {
+          cleaningStatus: "pending",
+          cleaningRequestSource: "inspector",
+          cleaningRequestedAt: new Date(),
+          cleaningDescription: inspectionCleaningDescription.trim(),
+          cleaningPhotoPaths: cleaningSummaryPhotos,
+          cleaningVideoPaths: cleaningSummaryVideos,
+        }
+      : {};
+
+    const summaryParts: string[] = [];
+    if (inspectionMaintenanceRequested) {
+      summaryParts.push("Maintenance Team");
+    }
+    if (inspectionCleaningRequested) {
+      summaryParts.push("Cleaners");
+    }
+    if (summaryParts.length === 0) {
+      summaryParts.push("history only");
+    }
+
     if (isLeaverRecord(record)) {
-      const completed: LeaverRecord = { ...record, inspectionReport: report };
+      const completed: LeaverRecord = {
+        ...record,
+        inspectionReport: report,
+        inspectionPhotoPaths: allPhotoPaths,
+        inspectionVideoPaths: allVideoPaths,
+        ...cleaningStamp,
+      };
       setInspectorLeavers((records) =>
         records.filter((item) => item.id !== record.id),
       );
       setInspectorHistory((records) => [completed, ...records]);
-      setTeamLeavers((queues) => ({
-        ...queues,
-        "Maintenance Team": [
-          { ...completed, department: "Maintenance Team" },
-          ...(queues["Maintenance Team"] ?? []),
-        ],
-      }));
+      if (inspectionMaintenanceRequested) {
+        setTeamLeavers((queues) => ({
+          ...queues,
+          "Maintenance Team": [
+            { ...completed, department: "Maintenance Team" },
+            ...(queues["Maintenance Team"] ?? []),
+          ],
+        }));
+      }
+      if (inspectionCleaningRequested) {
+        setCleanersPendingLeavers((records) => [completed, ...records]);
+      }
       void saveLeaverRecord(completed);
     } else {
-      const completed: TransferRecord = { ...record, inspectionReport: report };
+      const completed: TransferRecord = {
+        ...record,
+        inspectionReport: report,
+        inspectionPhotoPaths: allPhotoPaths,
+        inspectionVideoPaths: allVideoPaths,
+        ...cleaningStamp,
+      };
       setInspectorTransfers((records) =>
         records.filter((item) => item.id !== record.id),
       );
       setInspectorHistory((records) => [completed, ...records]);
-      setTeamTransfers((queues) => ({
-        ...queues,
-        "Maintenance Team": [
-          { ...completed, department: "Maintenance Team" },
-          ...(queues["Maintenance Team"] ?? []),
-        ],
-      }));
+      if (inspectionMaintenanceRequested) {
+        setTeamTransfers((queues) => ({
+          ...queues,
+          "Maintenance Team": [
+            { ...completed, department: "Maintenance Team" },
+            ...(queues["Maintenance Team"] ?? []),
+          ],
+        }));
+      }
+      if (inspectionCleaningRequested) {
+        setCleanersPendingTransfers((records) => [completed, ...records]);
+      }
       void saveTransferRecord(completed);
     }
 
     closeInspectionForm();
     toast.success("Inspection complete", {
-      description: `${inspectionPropertyAddress(record)} sent to Maintenance Team`,
+      description: `${inspectionPropertyAddress(record)} sent to: ${summaryParts.join(", ")}`,
     });
   }
 
-  function handleReferralSubmit(event: FormEvent<HTMLFormElement>) {
+  async function uploadIntakeFiles(recordId: number) {
+    const updates: Partial<ReferralRecord> = {};
+    const tasks: Promise<void>[] = [];
+
+    if (idPhotoFile) {
+      tasks.push(
+        uploadOne("referral-documents", ["referrals", recordId, "id"], idPhotoFile)
+          .then((path) => {
+            updates.idPhotoPath = path;
+          }),
+      );
+    }
+
+    if (proofOfIncomeFile) {
+      tasks.push(
+        uploadOne(
+          "referral-documents",
+          ["referrals", recordId, "proof-of-income"],
+          proofOfIncomeFile,
+        ).then((path) => {
+          updates.proofOfIncomePath = path;
+        }),
+      );
+    }
+
+    if (tasks.length === 0) {
+      return updates;
+    }
+
+    setIntakeUploading(true);
+    try {
+      await Promise.all(tasks);
+    } catch (error) {
+      console.error("Could not upload intake documents", error);
+      toast.error("Could not upload documents", {
+        description:
+          error instanceof Error ? error.message : "Please try again.",
+      });
+    } finally {
+      setIntakeUploading(false);
+    }
+
+    return updates;
+  }
+
+  async function handleReferralSubmit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
 
     if (referralStep < totalReferralSteps) {
@@ -2298,7 +3503,9 @@ export default function Home() {
     }
 
     if (failureReasons.length === 0) {
-      const record = createReferralRecord("driver", []);
+      let record = createReferralRecord("driver", []);
+      const uploaded = await uploadIntakeFiles(record.id);
+      record = { ...record, ...uploaded };
       setFollowUps((records) =>
         records.filter((followUp) => followUp.id !== editingFollowUpId),
       );
@@ -2318,7 +3525,9 @@ export default function Home() {
     }
 
     if (editingFollowUpId) {
-      const record = createReferralRecord("failed", failureReasons);
+      let record = createReferralRecord("failed", failureReasons);
+      const uploaded = await uploadIntakeFiles(record.id);
+      record = { ...record, ...uploaded };
       setFollowUps((records) =>
         records.filter((followUp) => followUp.id !== editingFollowUpId),
       );
@@ -2338,7 +3547,9 @@ export default function Home() {
       documentFailureReasons.length > 0 &&
       !failureReasons.includes("Age must be 18 or over.")
     ) {
-      const record = createReferralRecord("follow-up", documentFailureReasons);
+      let record = createReferralRecord("follow-up", documentFailureReasons);
+      const uploaded = await uploadIntakeFiles(record.id);
+      record = { ...record, ...uploaded };
       setFollowUps((records) => [record, ...records]);
       void saveReferralRecord(record);
       setEligibilityResult({
@@ -2351,7 +3562,9 @@ export default function Home() {
       return;
     }
 
-    const record = createReferralRecord("failed", failureReasons);
+    let record = createReferralRecord("failed", failureReasons);
+    const uploaded = await uploadIntakeFiles(record.id);
+    record = { ...record, ...uploaded };
     setHistory((records) => [record, ...records]);
     void saveReferralRecord(record);
     setEligibilityResult({
@@ -2363,26 +3576,673 @@ export default function Home() {
     });
   }
 
+  const toaster = (
+    <Toaster
+      closeButton
+      position="top-right"
+      richColors
+      theme="dark"
+      toastOptions={{
+        style: {
+          background: "var(--surface)",
+          border: "1px solid var(--border-strong)",
+          color: "var(--foreground)",
+        },
+      }}
+    />
+  );
+
+  const managerTeams: Array<{ label: string; pending: number }> = [
+    {
+      label: "Referral Officer",
+      pending: managerReferralRows.filter((row) => {
+        const s = row.statusByDepartment["Referral Officer"];
+        return s !== undefined && s !== "Done" && s !== "Rejected";
+      }).length,
+    },
+    {
+      label: "RMS Team",
+      pending: managerReferralRows.filter((row) => {
+        const s = row.statusByDepartment["RMS Team"];
+        return s !== undefined && s !== "Done" && s !== "Rejected";
+      }).length,
+    },
+    {
+      label: "HB Claims Team",
+      pending: managerReferralRows.filter((row) => {
+        const s = row.statusByDepartment["HB Claims Team"];
+        return s !== undefined && s !== "Done" && s !== "Rejected";
+      }).length,
+    },
+    {
+      label: "Tenants Management",
+      pending: managerReferralRows.filter((row) => {
+        const s = row.statusByDepartment["Tenants Management"];
+        return s !== undefined && s !== "Done" && s !== "Rejected";
+      }).length,
+    },
+    {
+      label: "Maintenance Team",
+      pending:
+        maintenancePendingLeavers.length + maintenancePendingTransfers.length,
+    },
+    {
+      label: "Inspector",
+      pending: inspectorLeavers.length + inspectorTransfers.length,
+    },
+    {
+      label: "Cleaners",
+      pending:
+        cleanersPendingLeavers.length + cleanersPendingTransfers.length,
+    },
+  ];
+
+  function openManagerSection(section: "dashboard" | "users" | "team", team?: string) {
+    setManagerView(section);
+    setManagerTeam(team ?? null);
+  }
+
+  const managerSidebar = (
+    <aside className="manager-sidebar" aria-label="Manager navigation">
+      <button
+        className="manager-sidebar-back"
+        onClick={() => {
+          setSelectedModule(null);
+          setManagerView("dashboard");
+          setManagerTeam(null);
+        }}
+        type="button"
+      >
+        ← Back to modules
+      </button>
+      <button
+        className={`manager-nav-item${
+          managerView === "dashboard" ? " active" : ""
+        }`}
+        onClick={() => openManagerSection("dashboard")}
+        type="button"
+      >
+        <span>Dashboard</span>
+      </button>
+      {managerTeams.map((entry) => {
+        const isActive =
+          managerView === "team" && managerTeam === entry.label;
+        return (
+          <button
+            className={`manager-nav-item${isActive ? " active" : ""}`}
+            key={entry.label}
+            onClick={() => openManagerSection("team", entry.label)}
+            type="button"
+          >
+            <span>{entry.label}</span>
+            <span
+              className={`manager-nav-badge${entry.pending === 0 ? " zero" : ""}`}
+            >
+              {entry.pending}
+            </span>
+          </button>
+        );
+      })}
+      <div className="manager-sidebar-divider" />
+      <button
+        className={`manager-nav-item${
+          managerView === "users" ? " active" : ""
+        }`}
+        onClick={() => openManagerSection("users")}
+        type="button"
+      >
+        <span>Manage users</span>
+      </button>
+    </aside>
+  );
+
+  function pillClassForStatus(status: string | undefined) {
+    if (!status) {
+      return "";
+    }
+    const slug = status.toLowerCase().replace(/\s+/g, "-");
+    return `kpi-status-pill ${slug}`;
+  }
+
+  if (!authReady) {
+    return (
+      <main className="module-page">
+        {toaster}
+        <div className="background-bubble bubble-one" />
+        <div className="background-bubble bubble-two" />
+        <div className="background-bubble bubble-three" />
+        <section className="auth-loading">
+          <p>Loading…</p>
+        </section>
+      </main>
+    );
+  }
+
+  if (!currentProfile) {
+    return (
+      <main className="module-page">
+        {toaster}
+        <div className="background-bubble bubble-one" />
+        <div className="background-bubble bubble-two" />
+        <div className="background-bubble bubble-three" />
+        <LoginScreen onAuthenticated={() => void getCurrentProfile().then(setCurrentProfile)} />
+      </main>
+    );
+  }
+
+  const isManagerView = currentProfile.role === "Manager";
+
   return (
     <main className="module-page">
-      <Toaster
-        closeButton
-        position="top-right"
-        richColors
-        theme="dark"
-        toastOptions={{
-          style: {
-            background: "var(--surface)",
-            border: "1px solid var(--border-strong)",
-            color: "var(--foreground)",
-          },
-        }}
-      />
+      {toaster}
       <div className="background-bubble bubble-one" />
       <div className="background-bubble bubble-two" />
       <div className="background-bubble bubble-three" />
 
-      {eligibilityResult && isNewReferral ? (
+      <header className="session-bar">
+        <span className="session-info">
+          Signed in as <strong>{currentProfile.fullName}</strong>
+          <em>{currentProfile.role}</em>
+        </span>
+        <button
+          className="secondary-button compact-session-button"
+          onClick={() => void handleSignOut()}
+          type="button"
+        >
+          Sign out
+        </button>
+      </header>
+
+      {isManagerView &&
+      selectedModule === "Manager" &&
+      managerView === "team" &&
+      managerTeam ? (
+        <div className="manager-shell">
+          {managerSidebar}
+          <section className="records-panel manager-main">
+          {(() => {
+            const team = managerTeam;
+            if (
+              team === "Referral Officer" ||
+              team === "RMS Team" ||
+              team === "HB Claims Team" ||
+              team === "Tenants Management"
+            ) {
+              const departmentRows = managerReferralRows.filter(
+                (row) => row.statusByDepartment[team] !== undefined,
+              );
+              const isCompleted = (status: string | undefined) =>
+                status === "Done" ||
+                status === "Rejected";
+              const pendingRows = departmentRows.filter(
+                (row) => !isCompleted(row.statusByDepartment[team]),
+              );
+              const completedRows = departmentRows.filter((row) =>
+                isCompleted(row.statusByDepartment[team]),
+              );
+              return (
+                <>
+                  <div className="records-heading">
+                    <h2>{team}</h2>
+                    <p>Pending versus completed referrals for this team.</p>
+                  </div>
+                  <div className="manager-kpi-grid">
+                    <article className="manager-kpi-card manager-kpi-card-pending">
+                      <strong>Pending</strong>
+                      <span>
+                        <KpiNumber value={pendingRows.length} />
+                      </span>
+                    </article>
+                    <article className="manager-kpi-card manager-kpi-card-success">
+                      <strong>Completed</strong>
+                      <span>
+                        <KpiNumber value={completedRows.length} />
+                      </span>
+                    </article>
+                  </div>
+                  <section className="manager-team-section">
+                    <div className="manager-team-header">
+                      <h3>Referrals</h3>
+                      <small>
+                        Each row shows who logged the referral and where it
+                        sits.
+                      </small>
+                    </div>
+                    {departmentRows.length === 0 ? (
+                      <p className="empty-records">No referrals yet.</p>
+                    ) : (
+                      <div className="manager-table-wrap">
+                        <table className="manager-table">
+                          <thead>
+                            <tr>
+                              <th>Tenant</th>
+                              <th>Referral officer (who logged)</th>
+                              <th>Submitted</th>
+                              <th>Status</th>
+                            </tr>
+                          </thead>
+                          <tbody>
+                            {departmentRows.map(({ record, statusByDepartment }) => {
+                              const status = statusByDepartment[team];
+                              return (
+                                <tr key={record.id}>
+                                  <td>{record.fullName}</td>
+                                  <td>{record.referralOfficer || "—"}</td>
+                                  <td>{formatDisplayDate(record.createdAt)}</td>
+                                  <td>
+                                    {status ? (
+                                      <span className={pillClassForStatus(status)}>
+                                        {status}
+                                      </span>
+                                    ) : (
+                                      "—"
+                                    )}
+                                  </td>
+                                </tr>
+                              );
+                            })}
+                          </tbody>
+                        </table>
+                      </div>
+                    )}
+                  </section>
+                </>
+              );
+            }
+
+            if (team === "Maintenance Team") {
+              const pendingLeavers = maintenancePendingLeavers;
+              const pendingTransfers = maintenancePendingTransfers;
+              const completedLeavers =
+                teamLeaverHistory["Maintenance Team"] ?? [];
+              const completedTransfers =
+                teamTransferHistory["Maintenance Team"] ?? [];
+              const pendingCount =
+                pendingLeavers.length + pendingTransfers.length;
+              const completedCount =
+                completedLeavers.length + completedTransfers.length;
+              const allRows: Array<{
+                key: string;
+                address: string;
+                dateAsked: Date;
+                dateAssigned?: string;
+                requestedBy: string;
+                status: string;
+              }> = [];
+              pendingLeavers.forEach((r) =>
+                allRows.push({
+                  key: `mp-leaver-${r.id}`,
+                  address: `${r.propertyAddress} | Room ${r.roomNumber}`,
+                  dateAsked:
+                    r.inspectionReport?.completedAt ?? r.createdAt,
+                  dateAssigned: r.assignedJobDate,
+                  requestedBy:
+                    r.inspectionReport?.inspectorName ?? r.assignedBy ?? "—",
+                  status: "Pending",
+                }),
+              );
+              pendingTransfers.forEach((r) =>
+                allRows.push({
+                  key: `mp-transfer-${r.id}`,
+                  address: `${r.currentProperty} | Room ${r.currentRoomNumber}`,
+                  dateAsked:
+                    r.inspectionReport?.completedAt ?? r.createdAt,
+                  dateAssigned: r.assignedJobDate,
+                  requestedBy:
+                    r.inspectionReport?.inspectorName ?? r.assignedBy ?? "—",
+                  status: "Pending",
+                }),
+              );
+              completedLeavers.forEach((r) =>
+                allRows.push({
+                  key: `mc-leaver-${r.id}`,
+                  address: `${r.propertyAddress} | Room ${r.roomNumber}`,
+                  dateAsked:
+                    r.inspectionReport?.completedAt ?? r.createdAt,
+                  dateAssigned: r.assignedJobDate,
+                  requestedBy:
+                    r.inspectionReport?.inspectorName ?? r.assignedBy ?? "—",
+                  status: "Completed",
+                }),
+              );
+              completedTransfers.forEach((r) =>
+                allRows.push({
+                  key: `mc-transfer-${r.id}`,
+                  address: `${r.currentProperty} | Room ${r.currentRoomNumber}`,
+                  dateAsked:
+                    r.inspectionReport?.completedAt ?? r.createdAt,
+                  dateAssigned: r.assignedJobDate,
+                  requestedBy:
+                    r.inspectionReport?.inspectorName ?? r.assignedBy ?? "—",
+                  status: "Completed",
+                }),
+              );
+              allRows.sort(
+                (a, b) => b.dateAsked.getTime() - a.dateAsked.getTime(),
+              );
+
+              return (
+                <>
+                  <div className="records-heading">
+                    <h2>Maintenance Team</h2>
+                    <p>Maintenance jobs across all properties.</p>
+                  </div>
+                  <div className="manager-kpi-grid">
+                    <article className="manager-kpi-card manager-kpi-card-pending">
+                      <strong>Pending jobs</strong>
+                      <span>
+                        <KpiNumber value={pendingCount} />
+                      </span>
+                    </article>
+                    <article className="manager-kpi-card manager-kpi-card-success">
+                      <strong>Completed</strong>
+                      <span>
+                        <KpiNumber value={completedCount} />
+                      </span>
+                    </article>
+                  </div>
+                  <section className="manager-team-section">
+                    <div className="manager-team-header">
+                      <h3>Jobs</h3>
+                      <small>
+                        Address, date asked, date assigned, requester and
+                        current status.
+                      </small>
+                    </div>
+                    {allRows.length === 0 ? (
+                      <p className="empty-records">
+                        No maintenance work tracked yet.
+                      </p>
+                    ) : (
+                      <div className="manager-table-wrap">
+                        <table className="manager-table">
+                          <thead>
+                            <tr>
+                              <th>Address</th>
+                              <th>Date asked</th>
+                              <th>Date assigned</th>
+                              <th>Requested by</th>
+                              <th>Status</th>
+                            </tr>
+                          </thead>
+                          <tbody>
+                            {allRows.map((row) => (
+                              <tr key={row.key}>
+                                <td>{row.address}</td>
+                                <td>{formatDisplayDate(row.dateAsked)}</td>
+                                <td>
+                                  {row.dateAssigned
+                                    ? formatDisplayDate(row.dateAssigned)
+                                    : "—"}
+                                </td>
+                                <td>{row.requestedBy}</td>
+                                <td>
+                                  <span className={pillClassForStatus(row.status)}>
+                                    {row.status}
+                                  </span>
+                                </td>
+                              </tr>
+                            ))}
+                          </tbody>
+                        </table>
+                      </div>
+                    )}
+                  </section>
+                </>
+              );
+            }
+
+            if (team === "Inspector") {
+              const pendingLeavers = inspectorLeavers;
+              const pendingTransfers = inspectorTransfers;
+              const inspected = inspectorHistory;
+              return (
+                <>
+                  <div className="records-heading">
+                    <h2>Inspector</h2>
+                    <p>
+                      Properties waiting on inspection and those already
+                      inspected.
+                    </p>
+                  </div>
+                  <div className="manager-kpi-grid">
+                    <article className="manager-kpi-card manager-kpi-card-pending">
+                      <strong>Pending inspection</strong>
+                      <span>
+                        <KpiNumber
+                          value={
+                            pendingLeavers.length + pendingTransfers.length
+                          }
+                        />
+                      </span>
+                    </article>
+                    <article className="manager-kpi-card manager-kpi-card-success">
+                      <strong>Inspected</strong>
+                      <span>
+                        <KpiNumber value={inspected.length} />
+                      </span>
+                    </article>
+                  </div>
+                  <section className="manager-team-section">
+                    <div className="manager-team-header">
+                      <h3>Pending inspection</h3>
+                    </div>
+                    {pendingLeavers.length + pendingTransfers.length === 0 ? (
+                      <p className="empty-records">
+                        Nothing awaiting inspection.
+                      </p>
+                    ) : (
+                      <ul className="manager-simple-list" role="list">
+                        {pendingLeavers.map((r) => (
+                          <li key={`ipl-${r.id}`}>
+                            <strong>{r.propertyAddress}</strong>
+                            <small>
+                              Room {r.roomNumber} · Leaver · added{" "}
+                              {formatDisplayDate(r.createdAt)}
+                            </small>
+                          </li>
+                        ))}
+                        {pendingTransfers.map((r) => (
+                          <li key={`ipt-${r.id}`}>
+                            <strong>{r.currentProperty}</strong>
+                            <small>
+                              Room {r.currentRoomNumber} · Transfer · added{" "}
+                              {formatDisplayDate(r.createdAt)}
+                            </small>
+                          </li>
+                        ))}
+                      </ul>
+                    )}
+                  </section>
+                  <section className="manager-team-section">
+                    <div className="manager-team-header">
+                      <h3>Inspected</h3>
+                    </div>
+                    {inspected.length === 0 ? (
+                      <p className="empty-records">No inspections yet.</p>
+                    ) : (
+                      <ul className="manager-simple-list" role="list">
+                        {inspected.map((r) => (
+                          <li key={`ih-${r.id}`}>
+                            <strong>{inspectionPropertyAddress(r)}</strong>
+                            <small>
+                              Room {inspectionRoomNumber(r)} · inspected{" "}
+                              {r.inspectionReport?.completedAt
+                                ? formatDisplayDate(
+                                    r.inspectionReport.completedAt,
+                                  )
+                                : "—"}
+                            </small>
+                          </li>
+                        ))}
+                      </ul>
+                    )}
+                  </section>
+                </>
+              );
+            }
+
+            if (team === "Cleaners") {
+              const allCleaning: Array<{
+                key: string;
+                address: string;
+                source: string;
+                dateAsked?: Date;
+                dateAssigned?: Date;
+                status: string;
+              }> = [];
+              cleanersPendingLeavers.forEach((r) =>
+                allCleaning.push({
+                  key: `clp-l-${r.id}`,
+                  address: `${r.propertyAddress} | Room ${r.roomNumber}`,
+                  source:
+                    r.cleaningRequestSource === "maintenance"
+                      ? "Maintenance"
+                      : "Inspector",
+                  dateAsked: r.cleaningRequestedAt,
+                  dateAssigned: r.cleaningAssignedAt,
+                  status:
+                    r.cleaningStatus === "assigned" ? "Assigned" : "Pending",
+                }),
+              );
+              cleanersPendingTransfers.forEach((r) =>
+                allCleaning.push({
+                  key: `clp-t-${r.id}`,
+                  address: `${r.currentProperty} | Room ${r.currentRoomNumber}`,
+                  source:
+                    r.cleaningRequestSource === "maintenance"
+                      ? "Maintenance"
+                      : "Inspector",
+                  dateAsked: r.cleaningRequestedAt,
+                  dateAssigned: r.cleaningAssignedAt,
+                  status:
+                    r.cleaningStatus === "assigned" ? "Assigned" : "Pending",
+                }),
+              );
+              cleanersHistoryLeavers.forEach((r) =>
+                allCleaning.push({
+                  key: `clh-l-${r.id}`,
+                  address: `${r.propertyAddress} | Room ${r.roomNumber}`,
+                  source:
+                    r.cleaningRequestSource === "maintenance"
+                      ? "Maintenance"
+                      : "Inspector",
+                  dateAsked: r.cleaningRequestedAt,
+                  dateAssigned: r.cleaningAssignedAt,
+                  status: "Cleaned",
+                }),
+              );
+              cleanersHistoryTransfers.forEach((r) =>
+                allCleaning.push({
+                  key: `clh-t-${r.id}`,
+                  address: `${r.currentProperty} | Room ${r.currentRoomNumber}`,
+                  source:
+                    r.cleaningRequestSource === "maintenance"
+                      ? "Maintenance"
+                      : "Inspector",
+                  dateAsked: r.cleaningRequestedAt,
+                  dateAssigned: r.cleaningAssignedAt,
+                  status: "Cleaned",
+                }),
+              );
+
+              const pendingCount =
+                cleanersPendingLeavers.length +
+                cleanersPendingTransfers.length;
+              const cleanedCount =
+                cleanersHistoryLeavers.length +
+                cleanersHistoryTransfers.length;
+
+              return (
+                <>
+                  <div className="records-heading">
+                    <h2>Cleaners</h2>
+                    <p>
+                      Cleaning jobs requested by the inspector or maintenance,
+                      handled by Tenants Management.
+                    </p>
+                  </div>
+                  <div className="manager-kpi-grid">
+                    <article className="manager-kpi-card manager-kpi-card-pending">
+                      <strong>Rooms needing cleaning</strong>
+                      <span>
+                        <KpiNumber value={pendingCount} />
+                      </span>
+                    </article>
+                    <article className="manager-kpi-card manager-kpi-card-success">
+                      <strong>Cleaned</strong>
+                      <span>
+                        <KpiNumber value={cleanedCount} />
+                      </span>
+                    </article>
+                  </div>
+                  <section className="manager-team-section">
+                    <div className="manager-team-header">
+                      <h3>Rooms</h3>
+                      <small>
+                        Each row shows whether the room is cleaned, when it was
+                        asked, and when it was assigned.
+                      </small>
+                    </div>
+                    {allCleaning.length === 0 ? (
+                      <p className="empty-records">
+                        No cleaning jobs tracked yet.
+                      </p>
+                    ) : (
+                      <div className="manager-table-wrap">
+                        <table className="manager-table">
+                          <thead>
+                            <tr>
+                              <th>Address</th>
+                              <th>Requested by</th>
+                              <th>Date asked</th>
+                              <th>Date assigned</th>
+                              <th>Status</th>
+                            </tr>
+                          </thead>
+                          <tbody>
+                            {allCleaning.map((row) => (
+                              <tr key={row.key}>
+                                <td>{row.address}</td>
+                                <td>{row.source}</td>
+                                <td>
+                                  {row.dateAsked
+                                    ? formatDisplayDate(row.dateAsked)
+                                    : "—"}
+                                </td>
+                                <td>
+                                  {row.dateAssigned
+                                    ? formatDisplayDate(row.dateAssigned)
+                                    : "—"}
+                                </td>
+                                <td>
+                                  <span className={pillClassForStatus(row.status)}>
+                                    {row.status}
+                                  </span>
+                                </td>
+                              </tr>
+                            ))}
+                          </tbody>
+                        </table>
+                      </div>
+                    )}
+                  </section>
+                </>
+              );
+            }
+
+            return null;
+          })()}
+          </section>
+        </div>
+      ) : isManagerView && selectedModule === "Manager" && managerView === "users" ? (
+        <div className="manager-shell">
+          {managerSidebar}
+          <section className="records-panel manager-main">
+            <UsersAdmin currentUserId={currentProfile.id} />
+          </section>
+        </div>
+      ) : eligibilityResult && isNewReferral ? (
         <section className="eligibility-screen">
           <div className={`eligibility-card ${eligibilityResult.status}`}>
             <span>
@@ -2459,7 +4319,7 @@ export default function Home() {
           </div>
         )}
 
-        {!selectedModule ? (
+        {!selectedModule && currentProfile.role !== "Manager" ? null : !selectedModule ? (
           <div className="module-grid">
             {assignedModules.map((module, index) => (
               <OptionCard
@@ -2580,19 +4440,86 @@ export default function Home() {
 
                         {record.propertyAccepted ? (
                           <div className="signature-panel">
+                            <div className="viewing-sd-grid">
+                              {VIEWING_SLOT_INDICES.map(
+                                (slotIndex, viewingIndex) => {
+                                  const slot = SD_SLOTS[slotIndex];
+                                  const file =
+                                    viewingSdFiles[record.id]?.[viewingIndex];
+                                  return (
+                                    <label
+                                      className={`sd-slot${file ? " ready" : ""}`}
+                                      key={slot.code}
+                                    >
+                                      <span className="sd-slot-label">
+                                        {slot.code} {slot.name}
+                                        <em aria-hidden="true">*</em>
+                                      </span>
+                                      <input
+                                        accept={SD_ACCEPT}
+                                        onChange={(event) => {
+                                          const picked =
+                                            event.target.files?.[0] ?? null;
+                                          setViewingSdFiles((current) => {
+                                            const slots =
+                                              current[record.id] ??
+                                              Array(
+                                                VIEWING_SLOT_INDICES.length,
+                                              ).fill(null);
+                                            const nextSlots = [...slots];
+                                            nextSlots[viewingIndex] = picked;
+                                            return {
+                                              ...current,
+                                              [record.id]: nextSlots,
+                                            };
+                                          });
+                                        }}
+                                        type="file"
+                                      />
+                                      <span className="sd-slot-status">
+                                        {file ? file.name : "Required"}
+                                      </span>
+                                    </label>
+                                  );
+                                },
+                              )}
+                            </div>
                             <label className="field file-field">
                               <span>Signature photo *</span>
                               <input
                                 accept="image/*"
                                 capture="environment"
+                                onChange={(event) => {
+                                  const file =
+                                    event.target.files?.[0] ?? null;
+                                  setSignaturePhotoFiles((current) => {
+                                    const next = { ...current };
+                                    if (file) {
+                                      next[record.id] = file;
+                                    } else {
+                                      delete next[record.id];
+                                    }
+                                    return next;
+                                  });
+                                }}
                                 type="file"
                               />
                               <small>
-                                Take a photo of the signed viewing form.
+                                {signaturePhotoFiles[record.id]
+                                  ? `Selected: ${signaturePhotoFiles[record.id].name}`
+                                  : "Take a photo of the signed viewing form."}
                               </small>
                             </label>
                             <button
                               className="submit-button compact-button"
+                              disabled={
+                                !signaturePhotoFiles[record.id] ||
+                                signatureUploading[record.id] ||
+                                VIEWING_SLOT_INDICES.some(
+                                  (_, viewingIndex) =>
+                                    !viewingSdFiles[record.id]?.[viewingIndex],
+                                )
+                              }
                               onClick={() =>
                                 void moveDriverReferralToHistory(
                                   record,
@@ -2601,7 +4528,9 @@ export default function Home() {
                               }
                               type="button"
                             >
-                              Finish as secured
+                              {signatureUploading[record.id]
+                                ? "Uploading…"
+                                : "Finish as secured"}
                             </button>
                           </div>
                         ) : (
@@ -2680,7 +4609,12 @@ export default function Home() {
                   details={formatFullHistoryDetails(selectedHistoryDetail)}
                   onAction={() => setSelectedHistoryDetail(null)}
                   title={getRecordTitle(selectedHistoryDetail)}
-                />
+                >
+                  <RecordMediaGallery
+                    items={getRecordMediaItems(selectedHistoryDetail)}
+                    title="Attachments"
+                  />
+                </HistoryDetailPanel>
               )}
               {history.filter(
                 (record) =>
@@ -2940,6 +4874,10 @@ export default function Home() {
                       rows={10}
                       value={formatFullHistoryDetails(selectedHistoryDetail)}
                     />
+                    <RecordMediaGallery
+                      items={getRecordMediaItems(selectedHistoryDetail)}
+                      title="Attachments"
+                    />
                   </section>
                 )}
                 {selectedSupportHistoryAction === "Transfer" ? (
@@ -3157,32 +5095,33 @@ export default function Home() {
               </button>
             </div>
             <div className="module-grid">
-              {processingOptions
-                .filter(
-                  (option) =>
-                    selectedModule === "Maintenance Team"
-                      ? option !== "New Referral"
-                      : option !== "Pending Jobs",
-                )
-                .map((option, index) => (
-                  (() => {
-                    const badge = getProcessingOptionBadge(option);
-
-                    return (
-                      <OptionCard
-                        alert={badge.alert}
-                        badgeCount={badge.count}
-                        index={index}
-                        key={option}
-                        label={option}
-                        onClick={() => {
-                          setSelectedProcessingAction(option);
-                          setSelectedProcessingHistoryAction(null);
-                        }}
-                      />
-                    );
-                  })()
-                ))}
+              {(() => {
+                const baseOptions = processingOptions.filter((option) =>
+                  selectedModule === "Maintenance Team"
+                    ? option !== "New Referral"
+                    : option !== "Pending Jobs",
+                );
+                const finalOptions =
+                  selectedModule === "Tenants Management"
+                    ? [...baseOptions, "Cleaners"]
+                    : baseOptions;
+                return finalOptions.map((option, index) => {
+                  const badge = getProcessingOptionBadge(option);
+                  return (
+                    <OptionCard
+                      alert={badge.alert}
+                      badgeCount={badge.count}
+                      index={index}
+                      key={option}
+                      label={option}
+                      onClick={() => {
+                        setSelectedProcessingAction(option);
+                        setSelectedProcessingHistoryAction(null);
+                      }}
+                    />
+                  );
+                });
+              })()}
             </div>
           </>
         ) : (isProcessingModule && selectedProcessingAction === "New Referral") ||
@@ -3252,20 +5191,86 @@ export default function Home() {
                       />
                     </label>
 
-                    <div className="document-grid">
-                      <div className="document-card">
-                        <span>ID Photo</span>
-                        <strong>Captured at reception</strong>
-                      </div>
-                      <div className="document-card">
-                        <span>Proof of Income</span>
-                        <strong>Captured at reception</strong>
-                      </div>
-                      <div className="document-card">
-                        <span>Signature Photo</span>
-                        <strong>Captured by driver</strong>
-                      </div>
-                    </div>
+                    <RecordMediaGallery
+                      emptyLabel="No attachments uploaded at reception or by driver."
+                      items={getRecordMediaItems(
+                        selectedHistoryDetail,
+                        selectedModule,
+                      )}
+                      title="Attachments"
+                    />
+
+                    {selectedModule === "Referral Officer" && (() => {
+                      const savedPaths =
+                        selectedHistoryDetail.sdDocumentPaths ?? [];
+                      const picked =
+                        sdDocumentFiles[selectedHistoryDetail.id] ?? [];
+                      const filledCount = BACK_FILLING_SLOT_INDICES.reduce(
+                        (count, slotIndex) =>
+                          count +
+                          (picked[slotIndex] || savedPaths[slotIndex] ? 1 : 0),
+                        0,
+                      );
+                      return (
+                        <section className="sd-documents-block">
+                          <div className="sd-documents-header">
+                            <h4>Supporting documents</h4>
+                            <small>
+                              All {BACK_FILLING_SLOT_INDICES.length} are
+                              required before back filling can be completed.
+                              {" "}
+                              {filledCount}/{BACK_FILLING_SLOT_INDICES.length}
+                              {" "}ready.
+                            </small>
+                          </div>
+                          <div className="sd-documents-grid">
+                            {BACK_FILLING_SLOT_INDICES.map((slotIndex) => {
+                              const slot = SD_SLOTS[slotIndex];
+                              const savedPath = savedPaths[slotIndex];
+                              const pickedFile = picked[slotIndex];
+                              const isReady = Boolean(pickedFile || savedPath);
+                              return (
+                                <label
+                                  className={`sd-slot${isReady ? " ready" : ""}`}
+                                  key={slot.code}
+                                >
+                                  <span className="sd-slot-label">
+                                    {slot.code} {slot.name}
+                                    <em aria-hidden="true">*</em>
+                                  </span>
+                                  <input
+                                    accept={SD_ACCEPT}
+                                    onChange={(event) => {
+                                      const file =
+                                        event.target.files?.[0] ?? null;
+                                      setSdDocumentFiles((prev) => {
+                                        const current = prev[
+                                          selectedHistoryDetail.id
+                                        ] ?? Array(SD_SLOT_COUNT).fill(null);
+                                        const next = [...current];
+                                        next[slotIndex] = file;
+                                        return {
+                                          ...prev,
+                                          [selectedHistoryDetail.id]: next,
+                                        };
+                                      });
+                                    }}
+                                    type="file"
+                                  />
+                                  <span className="sd-slot-status">
+                                    {pickedFile
+                                      ? pickedFile.name
+                                      : savedPath
+                                        ? "Uploaded"
+                                        : "Required"}
+                                  </span>
+                                </label>
+                              );
+                            })}
+                          </div>
+                        </section>
+                      );
+                    })()}
 
                     <label className="field">
                       <span>Cancellation reason</span>
@@ -3287,11 +5292,27 @@ export default function Home() {
                       />
                     </label>
 
+                    {(() => {
+                      const isRO = selectedModule === "Referral Officer";
+                      const savedPaths =
+                        selectedHistoryDetail.sdDocumentPaths ?? [];
+                      const picked =
+                        sdDocumentFiles[selectedHistoryDetail.id] ?? [];
+                      const allSdReady = BACK_FILLING_SLOT_INDICES.every(
+                        (slotIndex) =>
+                          picked[slotIndex] || savedPaths[slotIndex],
+                      );
+                      const isSdUploading =
+                        sdUploading[selectedHistoryDetail.id] ?? false;
+                      const uploadedDisabled =
+                        isRO && (!allSdReady || isSdUploading);
+                      return (
                     <div className="driver-actions">
                       <button
                         className="submit-button compact-button"
+                        disabled={uploadedDisabled}
                         onClick={() =>
-                          completeTeamReferral(
+                          void completeTeamReferral(
                             selectedModule ?? "",
                             selectedHistoryDetail,
                             "uploaded",
@@ -3299,7 +5320,7 @@ export default function Home() {
                         }
                         type="button"
                       >
-                        Uploaded
+                        {isRO && isSdUploading ? "Uploading..." : "Uploaded"}
                       </button>
                       <button
                         className="secondary-button dark-secondary-button"
@@ -3309,7 +5330,7 @@ export default function Home() {
                           ]?.trim()
                         }
                         onClick={() =>
-                          completeTeamReferral(
+                          void completeTeamReferral(
                             selectedModule ?? "",
                             selectedHistoryDetail,
                             "awaiting-information",
@@ -3327,7 +5348,7 @@ export default function Home() {
                           ]?.trim()
                         }
                         onClick={() =>
-                          completeTeamReferral(
+                          void completeTeamReferral(
                             selectedModule ?? "",
                             selectedHistoryDetail,
                             "rejected",
@@ -3338,6 +5359,8 @@ export default function Home() {
                         Cancel referral
                       </button>
                     </div>
+                      );
+                    })()}
                   </section>
                 )}
               {(
@@ -3471,6 +5494,10 @@ export default function Home() {
                       readOnly
                       rows={12}
                       value={formatFullHistoryDetails(selectedHistoryDetail)}
+                    />
+                    <RecordMediaGallery
+                      items={getRecordMediaItems(selectedHistoryDetail)}
+                      title="Attachments"
                     />
                   </section>
                 )}
@@ -3639,40 +5666,117 @@ export default function Home() {
                       </div>
                       <button
                         className="submit-button compact-button"
-                        disabled={!evidence.hasPhotos || !evidence.hasVideos}
+                        disabled={
+                          !evidence.hasPhotos ||
+                          !evidence.hasVideos ||
+                          maintenanceUploading[evidenceKey] ||
+                          maintenanceNeedsCleaning[evidenceKey] === undefined ||
+                          maintenanceNeedsCleaning[evidenceKey] === null
+                        }
                         onClick={() =>
-                          completeMaintenancePendingJob(record, "leaver")
+                          void completeMaintenancePendingJob(record, "leaver")
                         }
                         type="button"
                       >
-                        Job done
+                        {maintenanceUploading[evidenceKey]
+                          ? "Uploading…"
+                          : "Job done"}
                       </button>
+                      <fieldset className="cleaning-handoff">
+                        <legend>Does this site need cleaning afterwards?</legend>
+                        <label className="yes-no-option">
+                          <input
+                            checked={
+                              maintenanceNeedsCleaning[evidenceKey] === true
+                            }
+                            name={`needs-cleaning-leaver-${record.id}`}
+                            onChange={() =>
+                              setMaintenanceNeedsCleaning((current) => ({
+                                ...current,
+                                [evidenceKey]: true,
+                              }))
+                            }
+                            type="radio"
+                          />
+                          <span>Yes</span>
+                        </label>
+                        <label className="yes-no-option">
+                          <input
+                            checked={
+                              maintenanceNeedsCleaning[evidenceKey] === false
+                            }
+                            name={`needs-cleaning-leaver-${record.id}`}
+                            onChange={() =>
+                              setMaintenanceNeedsCleaning((current) => ({
+                                ...current,
+                                [evidenceKey]: false,
+                              }))
+                            }
+                            type="radio"
+                          />
+                          <span>No</span>
+                        </label>
+                      </fieldset>
                       <div className="form-grid">
                         <label className="field file-field">
                           <span>Attach completion photos *</span>
                           <input
                             accept="image/*"
                             capture="environment"
-                            onChange={(event) =>
-                              updateMaintenanceEvidence("leaver", record.id, {
-                                hasPhotos: (event.target.files?.length ?? 0) > 0,
-                              })
-                            }
+                            multiple
+                            onChange={(event) => {
+                              const files = Array.from(
+                                event.target.files ?? [],
+                              );
+                              setMaintenanceFiles(
+                                "leaver",
+                                record.id,
+                                "photos",
+                                files,
+                              );
+                            }}
                             type="file"
                           />
+                          {(maintenanceCompletionFiles[evidenceKey]?.photos
+                            ?.length ?? 0) > 0 && (
+                            <small>
+                              {
+                                maintenanceCompletionFiles[evidenceKey].photos
+                                  .length
+                              }{" "}
+                              photo(s) selected
+                            </small>
+                          )}
                         </label>
                         <label className="field file-field">
                           <span>Attach completion videos *</span>
                           <input
                             accept="video/*"
                             capture="environment"
-                            onChange={(event) =>
-                              updateMaintenanceEvidence("leaver", record.id, {
-                                hasVideos: (event.target.files?.length ?? 0) > 0,
-                              })
-                            }
+                            multiple
+                            onChange={(event) => {
+                              const files = Array.from(
+                                event.target.files ?? [],
+                              );
+                              setMaintenanceFiles(
+                                "leaver",
+                                record.id,
+                                "videos",
+                                files,
+                              );
+                            }}
                             type="file"
                           />
+                          {(maintenanceCompletionFiles[evidenceKey]?.videos
+                            ?.length ?? 0) > 0 && (
+                            <small>
+                              {
+                                maintenanceCompletionFiles[evidenceKey].videos
+                                  .length
+                              }{" "}
+                              video(s) selected
+                            </small>
+                          )}
                         </label>
                       </div>
                     </article>
@@ -3723,40 +5827,117 @@ export default function Home() {
                       </div>
                       <button
                         className="submit-button compact-button"
-                        disabled={!evidence.hasPhotos || !evidence.hasVideos}
+                        disabled={
+                          !evidence.hasPhotos ||
+                          !evidence.hasVideos ||
+                          maintenanceUploading[evidenceKey] ||
+                          maintenanceNeedsCleaning[evidenceKey] === undefined ||
+                          maintenanceNeedsCleaning[evidenceKey] === null
+                        }
                         onClick={() =>
-                          completeMaintenancePendingJob(record, "transfer")
+                          void completeMaintenancePendingJob(record, "transfer")
                         }
                         type="button"
                       >
-                        Job done
+                        {maintenanceUploading[evidenceKey]
+                          ? "Uploading…"
+                          : "Job done"}
                       </button>
+                      <fieldset className="cleaning-handoff">
+                        <legend>Does this site need cleaning afterwards?</legend>
+                        <label className="yes-no-option">
+                          <input
+                            checked={
+                              maintenanceNeedsCleaning[evidenceKey] === true
+                            }
+                            name={`needs-cleaning-transfer-${record.id}`}
+                            onChange={() =>
+                              setMaintenanceNeedsCleaning((current) => ({
+                                ...current,
+                                [evidenceKey]: true,
+                              }))
+                            }
+                            type="radio"
+                          />
+                          <span>Yes</span>
+                        </label>
+                        <label className="yes-no-option">
+                          <input
+                            checked={
+                              maintenanceNeedsCleaning[evidenceKey] === false
+                            }
+                            name={`needs-cleaning-transfer-${record.id}`}
+                            onChange={() =>
+                              setMaintenanceNeedsCleaning((current) => ({
+                                ...current,
+                                [evidenceKey]: false,
+                              }))
+                            }
+                            type="radio"
+                          />
+                          <span>No</span>
+                        </label>
+                      </fieldset>
                       <div className="form-grid">
                         <label className="field file-field">
                           <span>Attach completion photos *</span>
                           <input
                             accept="image/*"
                             capture="environment"
-                            onChange={(event) =>
-                              updateMaintenanceEvidence("transfer", record.id, {
-                                hasPhotos: (event.target.files?.length ?? 0) > 0,
-                              })
-                            }
+                            multiple
+                            onChange={(event) => {
+                              const files = Array.from(
+                                event.target.files ?? [],
+                              );
+                              setMaintenanceFiles(
+                                "transfer",
+                                record.id,
+                                "photos",
+                                files,
+                              );
+                            }}
                             type="file"
                           />
+                          {(maintenanceCompletionFiles[evidenceKey]?.photos
+                            ?.length ?? 0) > 0 && (
+                            <small>
+                              {
+                                maintenanceCompletionFiles[evidenceKey].photos
+                                  .length
+                              }{" "}
+                              photo(s) selected
+                            </small>
+                          )}
                         </label>
                         <label className="field file-field">
                           <span>Attach completion videos *</span>
                           <input
                             accept="video/*"
                             capture="environment"
-                            onChange={(event) =>
-                              updateMaintenanceEvidence("transfer", record.id, {
-                                hasVideos: (event.target.files?.length ?? 0) > 0,
-                              })
-                            }
+                            multiple
+                            onChange={(event) => {
+                              const files = Array.from(
+                                event.target.files ?? [],
+                              );
+                              setMaintenanceFiles(
+                                "transfer",
+                                record.id,
+                                "videos",
+                                files,
+                              );
+                            }}
                             type="file"
                           />
+                          {(maintenanceCompletionFiles[evidenceKey]?.videos
+                            ?.length ?? 0) > 0 && (
+                            <small>
+                              {
+                                maintenanceCompletionFiles[evidenceKey].videos
+                                  .length
+                              }{" "}
+                              video(s) selected
+                            </small>
+                          )}
                         </label>
                       </div>
                     </article>
@@ -3764,6 +5945,322 @@ export default function Home() {
                     })()
                   ))}
                 </>
+              )}
+            </div>
+          </section>
+        ) : isProcessingModule &&
+          selectedModule === "Tenants Management" &&
+          selectedProcessingAction === "Cleaners" ? (
+          <section className="records-panel">
+            <button
+              className="back-button"
+              onClick={() => setSelectedProcessingAction(null)}
+              type="button"
+            >
+              Back to {selectedModule} options
+            </button>
+            <div className="records-heading">
+              <h2>Cleaners</h2>
+              <p>
+                Cleaning jobs requested by the inspector or the maintenance
+                team. Upload photos and a video when each room is done.
+              </p>
+            </div>
+            <div className="manager-kpi-grid">
+              <article className="manager-kpi-card">
+                <strong>Pending cleaning</strong>
+                <span>
+                  <KpiNumber
+                    value={
+                      cleanersPendingLeavers.length +
+                      cleanersPendingTransfers.length
+                    }
+                  />
+                </span>
+              </article>
+              <article className="manager-kpi-card">
+                <strong>Cleaned</strong>
+                <span>
+                  <KpiNumber
+                    value={
+                      cleanersHistoryLeavers.length +
+                      cleanersHistoryTransfers.length
+                    }
+                  />
+                </span>
+              </article>
+            </div>
+            <div className="records-list">
+              <h3 className="cleaners-subheading">Pending jobs</h3>
+              {cleanersPendingLeavers.length === 0 &&
+              cleanersPendingTransfers.length === 0 ? (
+                <p className="empty-records">No cleaning jobs right now.</p>
+              ) : (
+                <>
+                  {cleanersPendingLeavers.map((record) => {
+                    const key = getCleaningKey("leaver", record.id);
+                    const evidence =
+                      cleaningCompletionEvidence[key] ?? {
+                        hasPhotos: false,
+                        hasVideos: false,
+                      };
+                    return (
+                      <article
+                        className="record-card"
+                        key={`cleaning-leaver-${record.id}`}
+                      >
+                        <div>
+                          <span className="record-status driver">Leaver</span>
+                          <h3>
+                            {inspectionPropertyAddress(record)} | Room{" "}
+                            {inspectionRoomNumber(record)}
+                          </h3>
+                          <small>
+                            {record.name} · requested by{" "}
+                            {record.cleaningRequestSource === "maintenance"
+                              ? "Maintenance Team"
+                              : "Inspector"}
+                          </small>
+                        </div>
+                        {record.cleaningDescription && (
+                          <p className="cleaners-description">
+                            {record.cleaningDescription}
+                          </p>
+                        )}
+                        <RecordMediaGallery
+                          items={getRecordMediaItems(record)}
+                          title="Brief from the requester"
+                        />
+                        <div className="form-grid">
+                          <label className="field file-field">
+                            <span>Attach completion photos *</span>
+                            <input
+                              accept="image/*"
+                              capture="environment"
+                              multiple
+                              onChange={(event) => {
+                                const files = Array.from(
+                                  event.target.files ?? [],
+                                );
+                                setCleaningFiles(
+                                  "leaver",
+                                  record.id,
+                                  "photos",
+                                  files,
+                                );
+                              }}
+                              type="file"
+                            />
+                            {(cleaningCompletionFiles[key]?.photos?.length ??
+                              0) > 0 && (
+                              <small>
+                                {
+                                  cleaningCompletionFiles[key].photos.length
+                                }{" "}
+                                photo(s) selected
+                              </small>
+                            )}
+                          </label>
+                          <label className="field file-field">
+                            <span>Attach completion video *</span>
+                            <input
+                              accept="video/*"
+                              capture="environment"
+                              multiple
+                              onChange={(event) => {
+                                const files = Array.from(
+                                  event.target.files ?? [],
+                                );
+                                setCleaningFiles(
+                                  "leaver",
+                                  record.id,
+                                  "videos",
+                                  files,
+                                );
+                              }}
+                              type="file"
+                            />
+                            {(cleaningCompletionFiles[key]?.videos?.length ??
+                              0) > 0 && (
+                              <small>
+                                {
+                                  cleaningCompletionFiles[key].videos.length
+                                }{" "}
+                                video(s) selected
+                              </small>
+                            )}
+                          </label>
+                        </div>
+                        <button
+                          className="submit-button compact-button"
+                          disabled={
+                            !evidence.hasPhotos ||
+                            !evidence.hasVideos ||
+                            cleaningUploading[key]
+                          }
+                          onClick={() =>
+                            void completeCleaningJob(record, "leaver")
+                          }
+                          type="button"
+                        >
+                          {cleaningUploading[key]
+                            ? "Uploading…"
+                            : "Cleaning done"}
+                        </button>
+                      </article>
+                    );
+                  })}
+                  {cleanersPendingTransfers.map((record) => {
+                    const key = getCleaningKey("transfer", record.id);
+                    const evidence =
+                      cleaningCompletionEvidence[key] ?? {
+                        hasPhotos: false,
+                        hasVideos: false,
+                      };
+                    return (
+                      <article
+                        className="record-card"
+                        key={`cleaning-transfer-${record.id}`}
+                      >
+                        <div>
+                          <span className="record-status driver">
+                            Transfer
+                          </span>
+                          <h3>
+                            {inspectionPropertyAddress(record)} | Room{" "}
+                            {inspectionRoomNumber(record)}
+                          </h3>
+                          <small>
+                            {record.name} · requested by{" "}
+                            {record.cleaningRequestSource === "maintenance"
+                              ? "Maintenance Team"
+                              : "Inspector"}
+                          </small>
+                        </div>
+                        {record.cleaningDescription && (
+                          <p className="cleaners-description">
+                            {record.cleaningDescription}
+                          </p>
+                        )}
+                        <RecordMediaGallery
+                          items={getRecordMediaItems(record)}
+                          title="Brief from the requester"
+                        />
+                        <div className="form-grid">
+                          <label className="field file-field">
+                            <span>Attach completion photos *</span>
+                            <input
+                              accept="image/*"
+                              capture="environment"
+                              multiple
+                              onChange={(event) => {
+                                const files = Array.from(
+                                  event.target.files ?? [],
+                                );
+                                setCleaningFiles(
+                                  "transfer",
+                                  record.id,
+                                  "photos",
+                                  files,
+                                );
+                              }}
+                              type="file"
+                            />
+                            {(cleaningCompletionFiles[key]?.photos?.length ??
+                              0) > 0 && (
+                              <small>
+                                {
+                                  cleaningCompletionFiles[key].photos.length
+                                }{" "}
+                                photo(s) selected
+                              </small>
+                            )}
+                          </label>
+                          <label className="field file-field">
+                            <span>Attach completion video *</span>
+                            <input
+                              accept="video/*"
+                              capture="environment"
+                              multiple
+                              onChange={(event) => {
+                                const files = Array.from(
+                                  event.target.files ?? [],
+                                );
+                                setCleaningFiles(
+                                  "transfer",
+                                  record.id,
+                                  "videos",
+                                  files,
+                                );
+                              }}
+                              type="file"
+                            />
+                            {(cleaningCompletionFiles[key]?.videos?.length ??
+                              0) > 0 && (
+                              <small>
+                                {
+                                  cleaningCompletionFiles[key].videos.length
+                                }{" "}
+                                video(s) selected
+                              </small>
+                            )}
+                          </label>
+                        </div>
+                        <button
+                          className="submit-button compact-button"
+                          disabled={
+                            !evidence.hasPhotos ||
+                            !evidence.hasVideos ||
+                            cleaningUploading[key]
+                          }
+                          onClick={() =>
+                            void completeCleaningJob(record, "transfer")
+                          }
+                          type="button"
+                        >
+                          {cleaningUploading[key]
+                            ? "Uploading…"
+                            : "Cleaning done"}
+                        </button>
+                      </article>
+                    );
+                  })}
+                </>
+              )}
+              <h3 className="cleaners-subheading">Cleaned history</h3>
+              {cleanersHistoryLeavers.length === 0 &&
+              cleanersHistoryTransfers.length === 0 ? (
+                <p className="empty-records">Nothing cleaned yet.</p>
+              ) : (
+                <ul className="cleaners-history" role="list">
+                  {[...cleanersHistoryLeavers, ...cleanersHistoryTransfers]
+                    .sort((a, b) => {
+                      const aTime =
+                        a.cleaningCompletedAt?.getTime() ??
+                        a.createdAt.getTime();
+                      const bTime =
+                        b.cleaningCompletedAt?.getTime() ??
+                        b.createdAt.getTime();
+                      return bTime - aTime;
+                    })
+                    .map((record) => {
+                      const key = `cleaning-history-${record.id}`;
+                      return (
+                        <li className="history-row" key={key}>
+                          <strong>{inspectionPropertyAddress(record)}</strong>
+                          <small>
+                            Room {inspectionRoomNumber(record)} ·{" "}
+                            {record.cleaningRequestSource === "maintenance"
+                              ? "from Maintenance"
+                              : "from Inspector"}
+                            {record.cleaningCompletedAt
+                              ? ` · ${formatDisplayDate(record.cleaningCompletedAt)}`
+                              : ""}
+                          </small>
+                        </li>
+                      );
+                    })}
+                </ul>
               )}
             </div>
           </section>
@@ -3824,6 +6321,10 @@ export default function Home() {
                           : formatFullHistoryDetails(selectedHistoryDetail)
                       }
                     />
+                    <RecordMediaGallery
+                      items={getRecordMediaItems(selectedHistoryDetail)}
+                      title="Attachments"
+                    />
                     {selectedModule === "Maintenance Team" &&
                       selectedHistoryDetail.inspectionReport && (
                         <section className="form-section">
@@ -3859,6 +6360,29 @@ export default function Home() {
                                   <li>Photos attached: {problem.photoCount}</li>
                                   <li>Videos attached: {problem.videoCount}</li>
                                 </ul>
+                                {(problem.photoPaths?.length ||
+                                  problem.videoPaths?.length) && (
+                                  <RecordMediaGallery
+                                    items={[
+                                      ...(problem.photoPaths ?? []).map(
+                                        (path, i) => ({
+                                          bucket: "maintenance-media" as const,
+                                          path,
+                                          kind: "photo" as const,
+                                          label: `Photo ${i + 1}`,
+                                        }),
+                                      ),
+                                      ...(problem.videoPaths ?? []).map(
+                                        (path, i) => ({
+                                          bucket: "maintenance-media" as const,
+                                          path,
+                                          kind: "video" as const,
+                                          label: `Video ${i + 1}`,
+                                        }),
+                                      ),
+                                    ]}
+                                  />
+                                )}
                               </article>
                             ),
                           )}
@@ -4027,6 +6551,10 @@ export default function Home() {
                         : formatFullHistoryDetails(selectedHistoryDetail)
                     }
                   />
+                  <RecordMediaGallery
+                    items={getRecordMediaItems(selectedHistoryDetail)}
+                    title="Attachments"
+                  />
                   {selectedModule === "Maintenance Team" &&
                     "propertyAddress" in selectedHistoryDetail &&
                     selectedHistoryDetail.inspectionReport && (
@@ -4063,6 +6591,29 @@ export default function Home() {
                                 <li>Photos attached: {problem.photoCount}</li>
                                 <li>Videos attached: {problem.videoCount}</li>
                               </ul>
+                              {(problem.photoPaths?.length ||
+                                problem.videoPaths?.length) && (
+                                <RecordMediaGallery
+                                  items={[
+                                    ...(problem.photoPaths ?? []).map(
+                                      (path, i) => ({
+                                        bucket: "maintenance-media" as const,
+                                        path,
+                                        kind: "photo" as const,
+                                        label: `Photo ${i + 1}`,
+                                      }),
+                                    ),
+                                    ...(problem.videoPaths ?? []).map(
+                                      (path, i) => ({
+                                        bucket: "maintenance-media" as const,
+                                        path,
+                                        kind: "video" as const,
+                                        label: `Video ${i + 1}`,
+                                      }),
+                                    ),
+                                  ]}
+                                />
+                              )}
                             </article>
                           ),
                         )}
@@ -4193,16 +6744,11 @@ export default function Home() {
             </div>
           </section>
         ) : isManager ? (
-          <section className="records-panel">
-            <button
-              className="back-button"
-              onClick={() => setSelectedModule(null)}
-              type="button"
-            >
-              Back to modules
-            </button>
+          <div className="manager-shell">
+            {managerSidebar}
+            <section className="records-panel manager-main">
             <div className="records-heading">
-              <h2>Manager Dashboard</h2>
+              <h2>Dashboard</h2>
               <p>
                 One command view for incoming referrals, team progress, reasons,
                 and assignments.
@@ -4210,7 +6756,7 @@ export default function Home() {
             </div>
             <div className="records-list">
               <div className="manager-kpi-grid">
-                <article className="manager-kpi-card">
+                <article className="manager-kpi-card manager-kpi-card-pending">
                   <strong>Incoming referrals</strong>
                   <span>
                     <KpiNumber value={driverQueue.length} />
@@ -4545,7 +7091,8 @@ export default function Home() {
                 </p>
               )}
             </div>
-          </section>
+            </section>
+          </div>
         ) : isInspector && !selectedInspectorAction ? (
           <>
             <div className="reception-actions">
@@ -4704,10 +7251,18 @@ export default function Home() {
                               accept="image/*"
                               multiple
                               onChange={(event) => {
-                                const added = event.target.files?.length ?? 0;
-                                if (added > 0) {
+                                const incoming = Array.from(
+                                  event.target.files ?? [],
+                                );
+                                if (incoming.length > 0) {
+                                  setInspectionFiles(
+                                    problem.id,
+                                    "photos",
+                                    incoming,
+                                  );
                                   updateInspectionProblem(problem.id, {
-                                    photoCount: problem.photoCount + added,
+                                    photoCount:
+                                      problem.photoCount + incoming.length,
                                   });
                                 }
                                 event.target.value = "";
@@ -4727,10 +7282,18 @@ export default function Home() {
                               accept="video/*"
                               multiple
                               onChange={(event) => {
-                                const added = event.target.files?.length ?? 0;
-                                if (added > 0) {
+                                const incoming = Array.from(
+                                  event.target.files ?? [],
+                                );
+                                if (incoming.length > 0) {
+                                  setInspectionFiles(
+                                    problem.id,
+                                    "videos",
+                                    incoming,
+                                  );
                                   updateInspectionProblem(problem.id, {
-                                    videoCount: problem.videoCount + added,
+                                    videoCount:
+                                      problem.videoCount + incoming.length,
                                   });
                                 }
                                 event.target.value = "";
@@ -4767,20 +7330,241 @@ export default function Home() {
                         </svg>
                       </button>
                     </div>
+                  </section>
+
+                  <section className="form-section inspection-summary-block">
+                    <div className="section-heading">
+                      <div>
+                        <h2>Maintenance required?</h2>
+                        <p>
+                          Decide whether this property needs the maintenance
+                          team. If yes, describe the work and attach overall
+                          photos / videos.
+                        </p>
+                      </div>
+                    </div>
+                    <div className="yes-no-row">
+                      <label className="yes-no-option">
+                        <input
+                          checked={inspectionMaintenanceRequested === true}
+                          name="inspection-maintenance"
+                          onChange={() =>
+                            setInspectionMaintenanceRequested(true)
+                          }
+                          type="radio"
+                        />
+                        <span>Yes</span>
+                      </label>
+                      <label className="yes-no-option">
+                        <input
+                          checked={inspectionMaintenanceRequested === false}
+                          name="inspection-maintenance"
+                          onChange={() => {
+                            setInspectionMaintenanceRequested(false);
+                            setInspectionMaintenanceDescription("");
+                            setInspectionMaintenancePhotos([]);
+                            setInspectionMaintenanceVideos([]);
+                          }}
+                          type="radio"
+                        />
+                        <span>No</span>
+                      </label>
+                    </div>
+                    {inspectionMaintenanceRequested === true && (
+                      <div className="form-grid">
+                        <label className="field field-wide">
+                          <span>Description *</span>
+                          <textarea
+                            onChange={(event) =>
+                              setInspectionMaintenanceDescription(
+                                event.target.value,
+                              )
+                            }
+                            placeholder="Describe the maintenance work needed"
+                            rows={3}
+                            value={inspectionMaintenanceDescription}
+                          />
+                        </label>
+                        <label className="field file-field">
+                          <span>
+                            Photos
+                            <em className="upload-count">
+                              {inspectionMaintenancePhotos.length}
+                            </em>
+                          </span>
+                          <input
+                            accept="image/*"
+                            multiple
+                            onChange={(event) => {
+                              const incoming = Array.from(
+                                event.target.files ?? [],
+                              );
+                              if (incoming.length > 0) {
+                                setInspectionMaintenancePhotos((prev) => [
+                                  ...prev,
+                                  ...incoming,
+                                ]);
+                              }
+                              event.target.value = "";
+                            }}
+                            type="file"
+                          />
+                          <small>Tap to add more photos</small>
+                        </label>
+                        <label className="field file-field">
+                          <span>
+                            Videos
+                            <em className="upload-count">
+                              {inspectionMaintenanceVideos.length}
+                            </em>
+                          </span>
+                          <input
+                            accept="video/*"
+                            multiple
+                            onChange={(event) => {
+                              const incoming = Array.from(
+                                event.target.files ?? [],
+                              );
+                              if (incoming.length > 0) {
+                                setInspectionMaintenanceVideos((prev) => [
+                                  ...prev,
+                                  ...incoming,
+                                ]);
+                              }
+                              event.target.value = "";
+                            }}
+                            type="file"
+                          />
+                          <small>Tap to add more videos</small>
+                        </label>
+                      </div>
+                    )}
+                  </section>
+
+                  <section className="form-section inspection-summary-block">
+                    <div className="section-heading">
+                      <div>
+                        <h2>Cleaning required?</h2>
+                        <p>
+                          Decide whether this property needs cleaning. If yes,
+                          describe what's needed and attach photos / videos.
+                          Cleaning jobs go to Tenants Management.
+                        </p>
+                      </div>
+                    </div>
+                    <div className="yes-no-row">
+                      <label className="yes-no-option">
+                        <input
+                          checked={inspectionCleaningRequested === true}
+                          name="inspection-cleaning"
+                          onChange={() => setInspectionCleaningRequested(true)}
+                          type="radio"
+                        />
+                        <span>Yes</span>
+                      </label>
+                      <label className="yes-no-option">
+                        <input
+                          checked={inspectionCleaningRequested === false}
+                          name="inspection-cleaning"
+                          onChange={() => {
+                            setInspectionCleaningRequested(false);
+                            setInspectionCleaningDescription("");
+                            setInspectionCleaningPhotos([]);
+                            setInspectionCleaningVideos([]);
+                          }}
+                          type="radio"
+                        />
+                        <span>No</span>
+                      </label>
+                    </div>
+                    {inspectionCleaningRequested === true && (
+                      <div className="form-grid">
+                        <label className="field field-wide">
+                          <span>Description *</span>
+                          <textarea
+                            onChange={(event) =>
+                              setInspectionCleaningDescription(
+                                event.target.value,
+                              )
+                            }
+                            placeholder="Describe the cleaning needed"
+                            rows={3}
+                            value={inspectionCleaningDescription}
+                          />
+                        </label>
+                        <label className="field file-field">
+                          <span>
+                            Photos
+                            <em className="upload-count">
+                              {inspectionCleaningPhotos.length}
+                            </em>
+                          </span>
+                          <input
+                            accept="image/*"
+                            multiple
+                            onChange={(event) => {
+                              const incoming = Array.from(
+                                event.target.files ?? [],
+                              );
+                              if (incoming.length > 0) {
+                                setInspectionCleaningPhotos((prev) => [
+                                  ...prev,
+                                  ...incoming,
+                                ]);
+                              }
+                              event.target.value = "";
+                            }}
+                            type="file"
+                          />
+                          <small>Tap to add more photos</small>
+                        </label>
+                        <label className="field file-field">
+                          <span>
+                            Videos
+                            <em className="upload-count">
+                              {inspectionCleaningVideos.length}
+                            </em>
+                          </span>
+                          <input
+                            accept="video/*"
+                            multiple
+                            onChange={(event) => {
+                              const incoming = Array.from(
+                                event.target.files ?? [],
+                              );
+                              if (incoming.length > 0) {
+                                setInspectionCleaningVideos((prev) => [
+                                  ...prev,
+                                  ...incoming,
+                                ]);
+                              }
+                              event.target.value = "";
+                            }}
+                            type="file"
+                          />
+                          <small>Tap to add more videos</small>
+                        </label>
+                      </div>
+                    )}
                     <div className="inspection-actions">
                       <button
                         className="submit-button"
                         disabled={
+                          inspectionUploading ||
                           inspectionDraft.filter(
                             (problem) => problem.description.trim().length > 0,
-                          ).length === 0
+                          ).length === 0 ||
+                          inspectionMaintenanceRequested === null ||
+                          inspectionCleaningRequested === null
                         }
                         onClick={() =>
-                          completeInspection(selectedInspectionTarget)
+                          void completeInspection(selectedInspectionTarget)
                         }
                         type="button"
                       >
-                        Complete inspection
+                        {inspectionUploading
+                          ? "Uploading…"
+                          : "Complete inspection"}
                       </button>
                     </div>
                   </section>
@@ -4909,6 +7693,29 @@ export default function Home() {
                             <li>Photos attached: {problem.photoCount}</li>
                             <li>Videos attached: {problem.videoCount}</li>
                           </ul>
+                          {(problem.photoPaths?.length ||
+                            problem.videoPaths?.length) && (
+                            <RecordMediaGallery
+                              items={[
+                                ...(problem.photoPaths ?? []).map(
+                                  (path, i) => ({
+                                    bucket: "maintenance-media" as const,
+                                    path,
+                                    kind: "photo" as const,
+                                    label: `Photo ${i + 1}`,
+                                  }),
+                                ),
+                                ...(problem.videoPaths ?? []).map(
+                                  (path, i) => ({
+                                    bucket: "maintenance-media" as const,
+                                    path,
+                                    kind: "video" as const,
+                                    label: `Video ${i + 1}`,
+                                  }),
+                                ),
+                              ]}
+                            />
+                          )}
                         </article>
                       ),
                     )}
@@ -5077,6 +7884,10 @@ export default function Home() {
                     readOnly
                     rows={12}
                     value={formatFullHistoryDetails(selectedHistoryDetail)}
+                  />
+                  <RecordMediaGallery
+                    items={getRecordMediaItems(selectedHistoryDetail)}
+                    title="Attachments"
                   />
                 </section>
               )}
@@ -5338,14 +8149,21 @@ export default function Home() {
                   </label>
 
                   <label className="field file-field">
-                    <span>ID photo *</span>
+                    <span>SD-10.1 Tenant ID *</span>
                     <input
                       accept="image/*"
                       capture="environment"
+                      onChange={(event) =>
+                        setIdPhotoFile(event.target.files?.[0] ?? null)
+                      }
                       required
                       type="file"
                     />
-                    <small>Use the camera to take a photo of the ID.</small>
+                    <small>
+                      {idPhotoFile
+                        ? `Selected: ${idPhotoFile.name}`
+                        : "Use the camera to take a photo of the tenant ID."}
+                    </small>
                   </label>
 
                   <div className="field field-wide">
@@ -5385,8 +8203,14 @@ export default function Home() {
                       capture={
                         proofMethod === "camera" ? "environment" : undefined
                       }
+                      onChange={(event) =>
+                        setProofOfIncomeFile(event.target.files?.[0] ?? null)
+                      }
                       type="file"
                     />
+                    {proofOfIncomeFile && (
+                      <small>Selected: {proofOfIncomeFile.name}</small>
+                    )}
                   </label>
 
                   <label className="field">
@@ -5411,14 +8235,23 @@ export default function Home() {
               {referralStep > 1 && (
                 <button
                   className="secondary-button"
+                  disabled={intakeUploading}
                   onClick={() => setReferralStep((currentStep) => currentStep - 1)}
                   type="button"
                 >
                   Back
                 </button>
               )}
-              <button className="submit-button" type="submit">
-                {referralStep === totalReferralSteps ? "Save reception intake" : "Next"}
+              <button
+                className="submit-button"
+                disabled={intakeUploading}
+                type="submit"
+              >
+                {intakeUploading
+                  ? "Uploading documents…"
+                  : referralStep === totalReferralSteps
+                    ? "Save reception intake"
+                    : "Next"}
               </button>
             </div>
           </form>

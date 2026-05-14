@@ -50,6 +50,8 @@ export const processingOptions = [
   "History",
 ];
 
+export const tenantsManagementExtraOption = "Cleaners";
+
 export const processingHistoryOptions = ["Leavers", "Transfers", "New Referrals"];
 
 export const supportOptions = ["Leaver", "Transfer", "History"];
