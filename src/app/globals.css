@@ -1,4 +1,13 @@
 :root {
+  --radius-sm: 8px;
+  --radius-md: 12px;
+  --radius-lg: 16px;
+  --radius-xl: 20px;
+}
+
+[data-theme="dark"] {
+  color-scheme: dark;
+
   --background: #0a0a0c;
   --background-elevated: #0f0f12;
   --surface: #131317;
@@ -22,10 +31,43 @@
   --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.4);
   --shadow-md: 0 8px 24px rgba(0, 0, 0, 0.5);
   --shadow-lg: 0 24px 60px rgba(0, 0, 0, 0.6);
-  --radius-sm: 8px;
-  --radius-md: 12px;
-  --radius-lg: 16px;
-  --radius-xl: 20px;
+  --page-gradient-a: rgba(59, 130, 246, 0.08);
+  --page-gradient-b: rgba(59, 130, 246, 0.04);
+
+  --navy: var(--surface-3);
+  --navy-deep: var(--background);
+  --navy-soft: var(--surface);
+  --card: var(--surface);
+}
+
+[data-theme="light"] {
+  color-scheme: light;
+
+  --background: #f8f9fb;
+  --background-elevated: #ffffff;
+  --surface: #ffffff;
+  --surface-2: #f4f4f5;
+  --surface-3: #e4e4e7;
+  --border: rgba(0, 0, 0, 0.08);
+  --border-strong: rgba(0, 0, 0, 0.14);
+  --foreground: #18181b;
+  --muted: #52525b;
+  --muted-2: #71717a;
+  --accent: #3b82f6;
+  --accent-strong: #2563eb;
+  --accent-soft: rgba(59, 130, 246, 0.1);
+  --accent-ring: rgba(59, 130, 246, 0.28);
+  --success: #16a34a;
+  --success-soft: rgba(22, 163, 74, 0.12);
+  --warning: #d97706;
+  --warning-soft: rgba(217, 119, 6, 0.12);
+  --danger: #dc2626;
+  --danger-soft: rgba(220, 38, 38, 0.1);
+  --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.06);
+  --shadow-md: 0 8px 24px rgba(0, 0, 0, 0.08);
+  --shadow-lg: 0 24px 60px rgba(0, 0, 0, 0.1);
+  --page-gradient-a: rgba(59, 130, 246, 0.06);
+  --page-gradient-b: rgba(59, 130, 246, 0.03);
 
   --navy: var(--surface-3);
   --navy-deep: var(--background);
@@ -85,8 +127,8 @@ textarea {
   overflow: hidden;
   padding: 20px 18px;
   background:
-    radial-gradient(circle at 18% 0%, rgba(59, 130, 246, 0.08), transparent 40rem),
-    radial-gradient(circle at 80% 100%, rgba(59, 130, 246, 0.04), transparent 40rem),
+    radial-gradient(circle at 18% 0%, var(--page-gradient-a), transparent 40rem),
+    radial-gradient(circle at 80% 100%, var(--page-gradient-b), transparent 40rem),
     var(--background);
 }
 
@@ -2028,6 +2070,66 @@ body:has(.module-shell > .module-grid) .hero-badge small {
   font-size: 0.7rem;
   letter-spacing: 0.04em;
   text-transform: uppercase;
+}
+
+.session-bar-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+}
+
+.login-theme-bar {
+  position: relative;
+  z-index: 2;
+  display: flex;
+  justify-content: flex-end;
+  margin-bottom: 12px;
+}
+
+.theme-toggle {
+  position: relative;
+}
+
+.theme-toggle-menu {
+  position: absolute;
+  top: calc(100% + 6px);
+  right: 0;
+  z-index: 20;
+  display: grid;
+  gap: 4px;
+  min-width: 140px;
+  padding: 6px;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-sm);
+  background: var(--surface);
+  box-shadow: var(--shadow-md);
+}
+
+.theme-toggle-option {
+  width: 100%;
+  padding: 8px 10px;
+  border: 1px solid transparent;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--foreground);
+  text-align: left;
+  cursor: pointer;
+  transition:
+    background 120ms ease,
+    border-color 120ms ease;
+}
+
+.theme-toggle-option:hover {
+  background: var(--surface-2);
+  border-color: var(--border);
+}
+
+.theme-toggle-option.is-active {
+  background: var(--accent-soft);
+  border-color: var(--accent-ring);
+  color: var(--accent-strong);
+  font-weight: 600;
 }
 
 .compact-session-button {

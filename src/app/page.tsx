@@ -38,6 +38,8 @@ import {
 import { BackButton } from "./components/BackButton";
 import { HistoryDetailPanel } from "./components/HistoryDetailPanel";
 import { LoginScreen } from "./components/LoginScreen";
+import { ThemeToggle } from "./components/ThemeToggle";
+import { useTheme } from "./components/ThemeProvider";
 import { OptionCard } from "./components/OptionCard";
 import { RecordMediaGallery } from "./components/RecordMediaGallery";
 import { UsersAdmin } from "./components/UsersAdmin";
@@ -209,6 +211,7 @@ const VIEWING_SLOT_INDICES: number[] = SD_SLOTS
 const SD_ACCEPT = "application/pdf,image/png,image/jpeg";
 
 export default function Home() {
+  const { theme } = useTheme();
   const [currentProfile, setCurrentProfile] = useState<Profile | null>(null);
   const [authReady, setAuthReady] = useState(false);
   const [managerView, setManagerView] = useState<
@@ -3581,7 +3584,7 @@ export default function Home() {
       closeButton
       position="top-right"
       richColors
-      theme="dark"
+      theme={theme}
       toastOptions={{
         style: {
           background: "var(--surface)",
@@ -3722,6 +3725,9 @@ export default function Home() {
     return (
       <main className="module-page">
         {toaster}
+        <div className="login-theme-bar">
+          <ThemeToggle />
+        </div>
         <div className="background-bubble bubble-one" />
         <div className="background-bubble bubble-two" />
         <div className="background-bubble bubble-three" />
@@ -3744,13 +3750,16 @@ export default function Home() {
           Signed in as <strong>{currentProfile.fullName}</strong>
           <em>{currentProfile.role}</em>
         </span>
-        <button
-          className="secondary-button compact-session-button"
-          onClick={() => void handleSignOut()}
-          type="button"
-        >
-          Sign out
-        </button>
+        <div className="session-bar-actions">
+          <ThemeToggle />
+          <button
+            className="secondary-button compact-session-button"
+            onClick={() => void handleSignOut()}
+            type="button"
+          >
+            Sign out
+          </button>
+        </div>
       </header>
 
       {isManagerView &&
