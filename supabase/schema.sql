@@ -208,3 +208,20 @@ on public.transfers for update
 to anon, authenticated
 using (true)
 with check (true);
+
+alter table public.referrals
+add column if not exists handoff_notes text,
+add column if not exists timeline_end date,
+add column if not exists monday_status text;
+
+alter table public.leavers
+add column if not exists property_inspected boolean not null default false,
+add column if not exists inspection_completed_at date,
+add column if not exists monday_status text;
+
+alter table public.transfers
+add column if not exists property_inspected boolean not null default false,
+add column if not exists inspection_completed_at date,
+add column if not exists monday_status text;
+
+notify pgrst, 'reload schema';

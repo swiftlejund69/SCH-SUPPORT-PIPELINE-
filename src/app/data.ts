@@ -36,11 +36,26 @@ export const securedReferralModules = [
   "Tenants Management",
 ];
 
+/** Parallel queues when Support Officer notifies a leaver. */
+export const leaverNotifyModules = [
+  "Tenants Management",
+  "HB Claims Team",
+] as const;
+
+/** @deprecated Use leaverNotifyModules */
+export const leaverInitialTeamModules = ["HB Claims Team"];
+
 export const leaverTargetModules = [
   "HB Claims Team",
   "RMS Team",
   "Tenants Management",
 ];
+
+/** Parallel queues when Support Officer notifies a transfer. */
+export const transferNotifyModules = [
+  "Tenants Management",
+  "HB Claims Team",
+] as const;
 
 export const processingOptions = [
   "New Referral",

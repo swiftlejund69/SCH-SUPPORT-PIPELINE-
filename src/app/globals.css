@@ -2751,23 +2751,37 @@ body:has(.module-shell > .module-grid) .hero-badge small {
 }
 
 .sd-slot-label {
+  display: grid;
+  gap: 2px;
+  color: var(--foreground);
+}
+
+.sd-slot-code {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
   font-size: 0.78rem;
   font-weight: 600;
   letter-spacing: 0.02em;
   text-transform: uppercase;
-  color: var(--foreground);
-  display: inline-flex;
-  align-items: center;
-  gap: 4px;
 }
 
-.sd-slot-label em {
+.sd-slot-name {
+  font-size: 0.72rem;
+  font-weight: 500;
+  text-transform: none;
+  letter-spacing: normal;
+  color: var(--muted);
+  line-height: 1.3;
+}
+
+.sd-slot-code em {
   color: #f87171;
   font-style: normal;
   font-weight: 700;
 }
 
-.sd-slot.ready .sd-slot-label em {
+.sd-slot.ready .sd-slot-code em {
   color: #4ade80;
 }
 
@@ -2863,4 +2877,51 @@ body:has(.module-shell > .module-grid) .hero-badge small {
 
 .media-lightbox-close:hover {
   background: rgba(255, 255, 255, 0.28);
+}
+
+.sd-documents-list {
+  display: grid;
+  gap: 8px;
+}
+
+.sd-slot-row {
+  grid-template-columns: minmax(180px, 1fr) minmax(200px, 2fr) auto;
+  align-items: center;
+}
+
+.viewing-sd-list {
+  display: grid;
+  gap: 8px;
+  margin-bottom: 10px;
+}
+
+.referral-detail-header {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-end;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 8px;
+}
+
+.referral-officer-label {
+  margin: 0;
+  font-size: 0.85rem;
+  color: var(--muted);
+}
+
+.referral-officer-label-key {
+  color: var(--foreground);
+  font-weight: 600;
+}
+
+.attachments-toolbar {
+  display: flex;
+  justify-content: flex-start;
+  margin: 0 0 8px;
+}
+
+.history-row.queue-row.is-selected {
+  border-color: var(--accent-ring);
+  background: var(--accent-soft);
 }
