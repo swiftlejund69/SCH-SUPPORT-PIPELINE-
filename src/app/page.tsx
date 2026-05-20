@@ -1,6 +1,6 @@
 "use client";
 
-import { type FormEvent, useEffect, useMemo, useState } from "react";
+import { type FormEvent, useEffect, useLayoutEffect, useMemo, useState } from "react";
 import { Toaster, toast } from "sonner";
 import {
   inspectorOptions,
@@ -56,6 +56,7 @@ import {
   type DownloadMediaItem,
 } from "../lib/download-referral-documents";
 import { downloadInspectionDocumentsZip } from "../lib/download-inspection-documents";
+import { getInitialTheme, LOGIN_THEME } from "../lib/theme";
 
 type SupabaseReferralRow = {
   app_record_id: number;
@@ -239,7 +240,7 @@ function renderSdSlotLabel(slot: { code: string; name: string }) {
 }
 
 export default function Home() {
-  const { theme } = useTheme();
+  const { theme, setTheme } = useTheme();
   const [currentProfile, setCurrentProfile] = useState<Profile | null>(null);
   const [authReady, setAuthReady] = useState(false);
   const [managerView, setManagerView] = useState<
@@ -581,6 +582,14 @@ export default function Home() {
       data.subscription.unsubscribe();
     };
   }, []);
+
+  useLayoutEffect(() => {
+    if (!authReady || !currentProfile) {
+      setTheme(LOGIN_THEME, false);
+      return;
+    }
+    setTheme(getInitialTheme());
+  }, [authReady, currentProfile, setTheme]);
 
   useEffect(() => {
     if (!currentProfile) {
@@ -4311,6 +4320,25 @@ export default function Home() {
     event.preventDefault();
 
     if (referralStep < totalReferralSteps) {
+      if (referralStep === 2) {
+        if (!tenantType.trim()) {
+          toast.error("Tenant type is required", {
+            description: "Please choose Single or Family before continuing.",
+          });
+          return;
+        }
+        const ageNum = age !== "" ? Number(age) : NaN;
+        if (!Number.isNaN(ageNum) && ageNum < 18) {
+          setEligibilityResult({
+            status: "failed",
+            reasons: ["Tenant must be 18 or over."],
+            title: "Not eligible",
+            message:
+              "Referrals are only accepted for tenants aged 18 and over. There is no need to collect NI number or proof of income for this referral.",
+          });
+          return;
+        }
+      }
       setReferralStep((currentStep) => currentStep + 1);
       setEligibilityResult(null);
       return;
@@ -4319,7 +4347,8 @@ export default function Home() {
     const failureReasons = [];
     const documentFailureReasons = [];
 
-    if (Number(age) < 18) {
+    const ageNum = age !== "" ? Number(age) : NaN;
+    if (!Number.isNaN(ageNum) && ageNum < 18) {
       failureReasons.push("Age must be 18 or over.");
     }
 
@@ -4556,9 +4585,6 @@ export default function Home() {
     return (
       <main className="module-page">
         {toaster}
-        <div className="login-theme-bar">
-          <ThemeToggle />
-        </div>
         <div className="background-bubble bubble-one" />
         <div className="background-bubble bubble-two" />
         <div className="background-bubble bubble-three" />
@@ -9065,7 +9091,7 @@ export default function Home() {
                   </label>
 
                   <label className="field">
-                    <span>Tenant Type</span>
+                    <span>Tenant Type *</span>
                     <select
                       onChange={(event) => {
                         setTenantType(event.target.value);
@@ -9073,9 +9099,12 @@ export default function Home() {
                           setFamilyMembersBelow10("");
                         }
                       }}
+                      required
                       value={tenantType}
                     >
-                      <option value="">Choose tenant type</option>
+                      <option value="" disabled>
+                        Choose tenant type
+                      </option>
                       <option value="single">Single</option>
                       <option value="family">Family</option>
                     </select>

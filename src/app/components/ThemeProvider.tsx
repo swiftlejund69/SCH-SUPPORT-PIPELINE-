@@ -4,38 +4,29 @@ import {
   createContext,
   useCallback,
   useContext,
-  useEffect,
   useMemo,
   useState,
   type ReactNode,
 } from "react";
 import {
   applyTheme,
-  DEFAULT_THEME,
-  getInitialTheme,
+  LOGIN_THEME,
   type Theme,
 } from "../../lib/theme";
 
 type ThemeContextValue = {
   theme: Theme;
-  setTheme: (theme: Theme) => void;
+  setTheme: (theme: Theme, persist?: boolean) => void;
 };
 
 const ThemeContext = createContext<ThemeContextValue | null>(null);
 
 export function ThemeProvider({ children }: { children: ReactNode }) {
-  const [theme, setThemeState] = useState<Theme>(DEFAULT_THEME);
+  const [theme, setThemeState] = useState<Theme>(LOGIN_THEME);
 
-  useEffect(() => {
-    setThemeState(getInitialTheme());
-  }, []);
-
-  useEffect(() => {
-    applyTheme(theme);
-  }, [theme]);
-
-  const setTheme = useCallback((next: Theme) => {
+  const setTheme = useCallback((next: Theme, persist = true) => {
     setThemeState(next);
+    applyTheme(next, { persist });
   }, []);
 
   const value = useMemo(
