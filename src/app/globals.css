@@ -1392,6 +1392,85 @@ body:has(.module-shell > .module-grid) .hero-badge small {
   color: var(--warning-foreground);
 }
 
+.record-status.support-doc-requested {
+  background: var(--warning-soft);
+  color: var(--warning-foreground);
+  font-weight: 700;
+  box-shadow: 0 0 0 1px color-mix(in srgb, var(--warning-foreground) 35%, transparent),
+    0 0 14px color-mix(in srgb, var(--warning-foreground) 45%, transparent);
+}
+
+.support-doc-request-row {
+  border-color: color-mix(in srgb, var(--warning-foreground) 40%, var(--border));
+  box-shadow: 0 0 18px color-mix(in srgb, var(--warning-foreground) 18%, transparent);
+}
+
+.support-doc-request-banner {
+  display: grid;
+  gap: 8px;
+  padding: 14px;
+  border-radius: var(--radius-md);
+  border: 1px solid color-mix(in srgb, var(--warning-foreground) 35%, var(--border));
+  background: var(--warning-soft);
+}
+
+.support-doc-request-reason {
+  margin: 0;
+  color: var(--foreground);
+  font-size: 0.9rem;
+  white-space: pre-wrap;
+}
+
+.support-doc-picker {
+  display: grid;
+  gap: 10px;
+  margin: 0;
+  padding: 14px;
+  border: 1px dashed var(--border-strong);
+  border-radius: var(--radius-md);
+}
+
+.support-doc-picker legend {
+  padding: 0 4px;
+  font-size: 0.85rem;
+  font-weight: 600;
+  color: var(--foreground);
+}
+
+.support-doc-picker-grid {
+  display: grid;
+  gap: 8px;
+  max-height: 220px;
+  overflow-y: auto;
+}
+
+.support-doc-picker-option {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  padding: 10px 12px;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border);
+  background: var(--surface-2);
+  cursor: pointer;
+}
+
+.support-doc-picker-option.selected {
+  border-color: color-mix(in srgb, var(--warning-foreground) 50%, var(--border));
+  background: var(--warning-soft);
+  box-shadow: 0 0 12px color-mix(in srgb, var(--warning-foreground) 20%, transparent);
+}
+
+.support-doc-picker-option input {
+  margin-top: 3px;
+}
+
+.sd-slot-requested {
+  border-color: color-mix(in srgb, var(--warning-foreground) 55%, var(--border-strong));
+  background: var(--warning-soft);
+  box-shadow: 0 0 16px color-mix(in srgb, var(--warning-foreground) 22%, transparent);
+}
+
 .record-status.rejected {
   background: var(--danger-soft);
   color: #f87171;
@@ -2040,6 +2119,7 @@ body:has(.module-shell > .module-grid) .hero-badge small {
 }
 
 .record-status.awaiting-information::before,
+.record-status.support-doc-requested::before,
 .record-status.failed::before,
 .record-status.rejected::before,
 .record-status.follow-up::before,

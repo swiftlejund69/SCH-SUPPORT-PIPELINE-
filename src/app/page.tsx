@@ -68,6 +68,13 @@ import {
   stripFollowUpMetaFromHandoff,
   unpackFollowUpFromHandoff,
 } from "../lib/referral-follow-up-meta";
+import {
+  packSupportDocHandoffNotes,
+  stripSupportDocMetaFromHandoff,
+  teamReturnsDocRequestToReferralOfficer,
+  unpackSupportDocRequest,
+} from "../lib/referral-support-doc-request";
+import type { SupportDocRequest } from "./types";
 
 type SupabaseReferralRow = {
   app_record_id: number;
@@ -240,6 +247,23 @@ const VIEWING_SLOT_INDICES: number[] = SD_SLOTS
   .filter((index) => index !== -1);
 const SD_ACCEPT = "application/pdf,image/png,image/jpeg";
 
+function getAwaitingInfoDocumentOptions(): { key: string; label: string }[] {
+  const options: { key: string; label: string }[] = [
+    { key: "id-photo", label: "SD-10.1 Tenant ID" },
+    { key: "proof-of-income", label: "Proof of income" },
+  ];
+
+  BACK_FILLING_SLOT_INDICES.forEach((slotIndex) => {
+    const slot = SD_SLOTS[slotIndex];
+    options.push({
+      key: `sd-${slotIndex}`,
+      label: `${slot.code} ${slot.name}`,
+    });
+  });
+
+  return options;
+}
+
 function renderSdSlotLabel(slot: { code: string; name: string }) {
   return (
     <span className="sd-slot-label">
@@ -411,6 +435,12 @@ export default function Home() {
   >([]);
   const [teamRejectionReasons, setTeamRejectionReasons] = useState<
     Record<string, string>
+  >({});
+  const [teamAwaitingDocumentKeys, setTeamAwaitingDocumentKeys] = useState<
+    Record<string, string>
+  >({});
+  const [roIntakeReplacementFiles, setRoIntakeReplacementFiles] = useState<
+    Record<number, { idPhoto?: File | null; proofOfIncome?: File | null }>
   >({});
   const [leaverScheduleDates, setLeaverScheduleDates] = useState<
     Record<
@@ -776,8 +806,31 @@ export default function Home() {
     setTransferHasMaintenanceVideos(false);
   }
 
-  function addRecordToMap<T>(map: Record<string, T[]>, key: string, record: T) {
-    map[key] = [record, ...(map[key] ?? [])];
+  function dedupeByRecordId<T extends { id: number }>(records: readonly T[]) {
+    const seen = new Set<number>();
+
+    return records.filter((record) => {
+      if (seen.has(record.id)) {
+        return false;
+      }
+      seen.add(record.id);
+      return true;
+    });
+  }
+
+  function upsertByRecordId<T extends { id: number }>(
+    records: readonly T[],
+    record: T,
+  ) {
+    return [record, ...records.filter((item) => item.id !== record.id)];
+  }
+
+  function addRecordToMap<T extends { id: number }>(
+    map: Record<string, T[]>,
+    key: string,
+    record: T,
+  ) {
+    map[key] = upsertByRecordId(map[key] ?? [], record);
   }
 
   function sortHistoryByNewestFirst<T extends { createdAt: Date }>(
@@ -1014,7 +1067,10 @@ export default function Home() {
       signaturePhotoPath: record.signature_photo_path ?? undefined,
       sdDocumentPaths: record.sd_document_paths ?? undefined,
       handoffNotes:
-        stripFollowUpMetaFromHandoff(record.handoff_notes) || undefined,
+        stripSupportDocMetaFromHandoff(
+          stripFollowUpMetaFromHandoff(record.handoff_notes),
+        ) || undefined,
+      supportDocRequest: unpackSupportDocRequest(record.handoff_notes),
       timelineEnd: record.timeline_end ?? undefined,
       mondayStatus: record.monday_status ?? undefined,
       referralOfficerStatus: record.referral_officer_status,
@@ -1254,58 +1310,88 @@ export default function Home() {
       }
 
       if (record.status === "secured") {
+        const supportDocRequest = record.supportDocRequest;
         const referralOfficerStatus = getSavedDepartmentStatus(
           row,
           "Referral Officer",
         );
-        const referralOfficerTeamRecord = {
+        const referralOfficerTeamRecord: TeamReferralRecord = {
           ...record,
           department: "Referral Officer",
+          supportDocRequest,
         };
+        const roReturnedForDocFix =
+          Boolean(supportDocRequest) && referralOfficerStatus === "stuck";
 
-        if (referralOfficerStatus) {
+        if (roReturnedForDocFix) {
+          addRecordToMap(loadedTeamQueues, "Referral Officer", {
+            ...referralOfficerTeamRecord,
+            teamRejectionReason: supportDocRequest?.reason,
+          });
+        } else if (referralOfficerStatus) {
           addRecordToMap(loadedTeamHistory, "Referral Officer", {
             ...referralOfficerTeamRecord,
             teamOutcome: getTeamOutcomeFromSavedStatus(referralOfficerStatus),
           });
-
-          const hbDone = Boolean(row.hb_claims_status);
-          const rmsDone = Boolean(row.rms_status);
-          const tmDone = Boolean(row.tenants_management_status);
-
-          (["HB Claims Team", "Tenants Management"] as const).forEach((department) => {
-            const teamRecord = { ...record, department };
-            const savedStatus = getSavedDepartmentStatus(row, department);
-
-            if (savedStatus) {
-              addRecordToMap(loadedTeamHistory, department, {
-                ...teamRecord,
-                teamOutcome: getTeamOutcomeFromSavedStatus(savedStatus),
-              });
-            } else if (referralOfficerStatus) {
-              addRecordToMap(loadedTeamQueues, department, teamRecord);
-            }
-          });
-
-          if (hbDone) {
-            const department = "RMS Team";
-            const teamRecord = { ...record, department };
-            const savedStatus = getSavedDepartmentStatus(row, department);
-            if (savedStatus) {
-              addRecordToMap(loadedTeamHistory, department, {
-                ...teamRecord,
-                teamOutcome: getTeamOutcomeFromSavedStatus(savedStatus),
-              });
-            } else if (!rmsDone) {
-              addRecordToMap(loadedTeamQueues, department, teamRecord);
-            }
-          }
         } else {
           addRecordToMap(
             loadedTeamQueues,
             "Referral Officer",
             referralOfficerTeamRecord,
           );
+        }
+
+        const hbDone = Boolean(row.hb_claims_status);
+        const rmsDone = Boolean(row.rms_status);
+
+        (["HB Claims Team", "Tenants Management"] as const).forEach(
+          (department) => {
+            const teamRecord: TeamReferralRecord = { ...record, department };
+            const savedStatus = getSavedDepartmentStatus(row, department);
+            const isRequestingDept =
+              supportDocRequest?.requestedBy === department;
+
+            if (savedStatus === "stuck" && isRequestingDept) {
+              addRecordToMap(loadedTeamHistory, department, {
+                ...teamRecord,
+                teamOutcome: "awaiting-information",
+                teamRejectionReason: supportDocRequest?.reason,
+                handledAt: supportDocRequest?.requestedAt,
+                escalationPausedAt: supportDocRequest?.requestedAt,
+              });
+            } else if (savedStatus) {
+              addRecordToMap(loadedTeamHistory, department, {
+                ...teamRecord,
+                teamOutcome: getTeamOutcomeFromSavedStatus(savedStatus),
+              });
+            } else if (referralOfficerStatus && !roReturnedForDocFix) {
+              addRecordToMap(loadedTeamQueues, department, teamRecord);
+            }
+          },
+        );
+
+        if (hbDone) {
+          const department = "RMS Team";
+          const teamRecord: TeamReferralRecord = { ...record, department };
+          const savedStatus = getSavedDepartmentStatus(row, department);
+          const isRequestingDept = supportDocRequest?.requestedBy === department;
+
+          if (savedStatus === "stuck" && isRequestingDept) {
+            addRecordToMap(loadedTeamHistory, department, {
+              ...teamRecord,
+              teamOutcome: "awaiting-information",
+              teamRejectionReason: supportDocRequest?.reason,
+              handledAt: supportDocRequest?.requestedAt,
+              escalationPausedAt: supportDocRequest?.requestedAt,
+            });
+          } else if (savedStatus) {
+            addRecordToMap(loadedTeamHistory, department, {
+              ...teamRecord,
+              teamOutcome: getTeamOutcomeFromSavedStatus(savedStatus),
+            });
+          } else if (!rmsDone && referralOfficerStatus && !roReturnedForDocFix) {
+            addRecordToMap(loadedTeamQueues, department, teamRecord);
+          }
         }
       }
     });
@@ -1320,9 +1406,16 @@ export default function Home() {
     }
 
     setFollowUps(sortHistoryByNewestFirst(activeFollowUps));
-    setDriverQueue(loadedDriverQueue);
+    setDriverQueue(dedupeByRecordId(loadedDriverQueue));
     setHistory(sortHistoryByNewestFirst(loadedHistory));
-    setTeamNewReferrals(loadedTeamQueues);
+    setTeamNewReferrals(
+      Object.fromEntries(
+        Object.entries(loadedTeamQueues).map(([department, records]) => [
+          department,
+          dedupeByRecordId(records),
+        ]),
+      ),
+    );
     setTeamHistory(sortHistoryMapByNewestFirst(loadedTeamHistory));
   }
 
@@ -1662,6 +1755,10 @@ export default function Home() {
       monday_item_id: record.mondayItemId || null,
     };
 
+    const handoffNotesForSave = record.supportDocRequest
+      ? packSupportDocHandoffNotes(record.handoffNotes, record.supportDocRequest)
+      : record.handoffNotes || null;
+
     const payloadWithFollowUpColumns = {
       ...basePayload,
       follow_up_reasons:
@@ -1669,7 +1766,7 @@ export default function Home() {
           ? record.reasons
           : null,
       tenant_type: record.tenantType || null,
-      handoff_notes: record.handoffNotes || null,
+      handoff_notes: handoffNotesForSave,
     };
 
     let result = await supabase
@@ -1904,6 +2001,26 @@ export default function Home() {
       toast.error("Could not update team status", {
         description: error.message,
       });
+    }
+  }
+
+  async function resetSupabaseTeamStatus(
+    appRecordId: number,
+    department: string,
+  ) {
+    const column = getTeamStatusColumn(department);
+
+    if (!column) {
+      return;
+    }
+
+    const { error } = await supabase
+      .from("referrals")
+      .update({ [column]: null })
+      .eq("app_record_id", appRecordId);
+
+    if (error) {
+      console.error("Could not reset team status in Supabase", error);
     }
   }
 
@@ -2351,13 +2468,10 @@ export default function Home() {
     if (status === "secured") {
       setTeamNewReferrals((queues) => ({
         ...queues,
-        "Referral Officer": [
-          {
-            ...completedRecord,
-            department: "Referral Officer",
-          },
-          ...(queues["Referral Officer"] ?? []),
-        ],
+        "Referral Officer": upsertByRecordId(queues["Referral Officer"] ?? [], {
+          ...completedRecord,
+          department: "Referral Officer",
+        }),
       }));
     }
   }
@@ -3434,30 +3548,157 @@ export default function Home() {
 
     let workingRecord: TeamReferralRecord = record;
 
+    if (
+      outcome === "awaiting-information" &&
+      teamReturnsDocRequestToReferralOfficer(department)
+    ) {
+      const docKey = teamAwaitingDocumentKeys[key];
+      if (!docKey) {
+        toast.error("Select a document", {
+          description:
+            "Choose which document needs to be corrected before sending to Referral Officer.",
+        });
+        return;
+      }
+
+      const selectedLabel = getAwaitingInfoDocumentOptions().find(
+        (option) => option.key === docKey,
+      )?.label;
+
+      if (!selectedLabel) {
+        return;
+      }
+
+      const supportDocRequest: SupportDocRequest = {
+        documentKey: docKey,
+        documentLabel: selectedLabel,
+        reason: rejectionReason,
+        requestedBy: department,
+        requestedAt: new Date(),
+      };
+
+      workingRecord = {
+        ...workingRecord,
+        supportDocRequest,
+        handoffNotes: packSupportDocHandoffNotes(
+          workingRecord.handoffNotes,
+          supportDocRequest,
+        ),
+      };
+
+      const completedRecord: TeamReferralRecord = {
+        ...workingRecord,
+        department,
+        teamOutcome: "awaiting-information",
+        teamRejectionReason: rejectionReason,
+        escalationPausedAt: new Date(),
+        handledAt: new Date(),
+      };
+
+      const roRecord: TeamReferralRecord = {
+        ...workingRecord,
+        department: "Referral Officer",
+        teamOutcome: undefined,
+        teamRejectionReason: undefined,
+        handledAt: undefined,
+        assignedTo: undefined,
+        assignedBy: undefined,
+        assignedAt: undefined,
+        escalationCount: 0,
+        escalationPausedAt: undefined,
+      };
+
+      setTeamNewReferrals((queues) => {
+        const next = { ...queues };
+        next[department] = (next[department] ?? []).filter(
+          (item) => item.id !== record.id,
+        );
+        next["Referral Officer"] = upsertByRecordId(
+          next["Referral Officer"] ?? [],
+          roRecord,
+        );
+        return next;
+      });
+
+      setTeamHistory((records) => ({
+        ...records,
+        [department]: [completedRecord, ...(records[department] ?? [])],
+      }));
+      setSelectedHistoryDetail(null);
+
+      await saveReferralRecord(workingRecord);
+      await updateSupabaseTeamStatus(
+        "referrals",
+        record.id,
+        department,
+        "awaiting-information",
+      );
+      await updateSupabaseTeamStatus(
+        "referrals",
+        record.id,
+        "Referral Officer",
+        "awaiting-information",
+      );
+
+      toast.success("Support doc requested", {
+        description: `${record.fullName} sent to Referral Officer Back filling — ${selectedLabel}`,
+      });
+      return;
+    }
+
     if (department === "HB Claims Team" && outcome === "uploaded") {
       setTeamNewReferrals((queues) => ({
         ...queues,
-        "RMS Team": [
-          {
-            ...workingRecord,
-            department: "RMS Team",
-            teamOutcome: undefined,
-            teamRejectionReason: undefined,
-            handledAt: undefined,
-            assignedTo: undefined,
-            assignedBy: undefined,
-            assignedAt: undefined,
-            escalationCount: 0,
-            escalationPausedAt: undefined,
-          },
-          ...(queues["RMS Team"] ?? []),
-        ],
+        "RMS Team": upsertByRecordId(queues["RMS Team"] ?? [], {
+          ...workingRecord,
+          department: "RMS Team",
+          teamOutcome: undefined,
+          teamRejectionReason: undefined,
+          handledAt: undefined,
+          assignedTo: undefined,
+          assignedBy: undefined,
+          assignedAt: undefined,
+          escalationCount: 0,
+          escalationPausedAt: undefined,
+        }),
       }));
     }
 
     if (department === "Referral Officer" && outcome === "uploaded") {
+      const docRequest = record.supportDocRequest;
+      const replacement = roIntakeReplacementFiles[record.id] ?? {};
       const savedPaths = record.sdDocumentPaths ?? [];
       const picked = sdDocumentFiles[record.id] ?? [];
+
+      if (docRequest) {
+        if (docRequest.documentKey === "id-photo" && !replacement.idPhoto) {
+          toast.error("Replacement required", {
+            description: `Upload a new ${docRequest.documentLabel} before marking uploaded.`,
+          });
+          return;
+        }
+
+        if (
+          docRequest.documentKey === "proof-of-income" &&
+          !replacement.proofOfIncome
+        ) {
+          toast.error("Replacement required", {
+            description: `Upload a new ${docRequest.documentLabel} before marking uploaded.`,
+          });
+          return;
+        }
+
+        if (docRequest.documentKey.startsWith("sd-")) {
+          const slotIndex = Number(docRequest.documentKey.replace("sd-", ""));
+          if (!picked[slotIndex]) {
+            toast.error("Replacement required", {
+              description: `Upload a new file for ${docRequest.documentLabel} before marking uploaded.`,
+            });
+            return;
+          }
+        }
+      }
+
       const missing = BACK_FILLING_SLOT_INDICES.filter(
         (slotIndex) => !(picked[slotIndex] || savedPaths[slotIndex]),
       );
@@ -3472,6 +3713,18 @@ export default function Home() {
 
       setSdUploading((prev) => ({ ...prev, [record.id]: true }));
       try {
+        if (replacement.idPhoto || replacement.proofOfIncome) {
+          const intakePaths = await uploadIntakeFiles(
+            record.id,
+            {
+              idPhoto: replacement.idPhoto ?? null,
+              proofOfIncome: replacement.proofOfIncome ?? null,
+            },
+            record,
+          );
+          workingRecord = { ...record, ...intakePaths };
+        }
+
         const mergedPaths: string[] = [];
         for (let i = 0; i < SD_SLOT_COUNT; i++) {
           const fresh = picked[i];
@@ -3487,11 +3740,20 @@ export default function Home() {
           }
         }
         workingRecord = {
-          ...record,
+          ...workingRecord,
           sdDocumentPaths: mergedPaths,
+          supportDocRequest: undefined,
+          handoffNotes:
+            stripSupportDocMetaFromHandoff(workingRecord.handoffNotes) ||
+            undefined,
         };
         await saveReferralRecord(workingRecord);
         setSdDocumentFiles((prev) => {
+          const next = { ...prev };
+          delete next[record.id];
+          return next;
+        });
+        setRoIntakeReplacementFiles((prev) => {
           const next = { ...prev };
           delete next[record.id];
           return next;
@@ -3544,29 +3806,38 @@ export default function Home() {
         ...workingRecord,
         referralOfficerStatus: "done",
       };
+      const notifyTeams = record.supportDocRequest
+        ? [record.supportDocRequest.requestedBy]
+        : (["HB Claims Team", "Tenants Management"] as const);
       setTeamNewReferrals((queues) => {
         const next = { ...queues };
-        (["HB Claims Team", "Tenants Management"] as const).forEach(
-          (team) => {
-            next[team] = [
-              {
-                ...workingRecord,
-                department: team,
-                teamOutcome: undefined,
-                teamRejectionReason: undefined,
-                handledAt: undefined,
-                assignedTo: undefined,
-                assignedBy: undefined,
-                assignedAt: undefined,
-                escalationCount: 0,
-                escalationPausedAt: undefined,
-              },
-              ...(next[team] ?? []),
-            ];
-          },
+        notifyTeams.forEach((team) => {
+          next[team] = upsertByRecordId(next[team] ?? [], {
+            ...workingRecord,
+            department: team,
+            teamOutcome: undefined,
+            teamRejectionReason: undefined,
+            handledAt: undefined,
+            assignedTo: undefined,
+            assignedBy: undefined,
+            assignedAt: undefined,
+            escalationCount: 0,
+            escalationPausedAt: undefined,
+            supportDocRequest: undefined,
+          });
+        });
+        next["Referral Officer"] = (next["Referral Officer"] ?? []).filter(
+          (item) => item.id !== record.id,
         );
         return next;
       });
+
+      if (record.supportDocRequest) {
+        await resetSupabaseTeamStatus(
+          record.id,
+          record.supportDocRequest.requestedBy,
+        );
+      }
     }
 
     await updateSupabaseTeamStatus("referrals", record.id, department, outcome);
@@ -5724,20 +5995,34 @@ export default function Home() {
               </BackButton>
             </div>
             <div className="module-grid">
-              {referralOfficerOptions.map((option, index) => (
-                <OptionCard
-                  index={index}
-                  key={option}
-                  label={option}
-                  onClick={() => {
-                    setSelectedDriverAction(option);
-                    setSelectedProcessingAction(
-                      option === "Back filling" ? "New Referral" : null,
-                    );
-                    setSelectedProcessingHistoryAction(null);
-                  }}
-                />
-              ))}
+              {referralOfficerOptions.map((option, index) => {
+                const supportDocCount =
+                  option === "Back filling"
+                    ? (teamNewReferrals["Referral Officer"] ?? []).filter(
+                        (item) => item.supportDocRequest,
+                      ).length
+                    : 0;
+                return (
+                  <OptionCard
+                    alert={supportDocCount > 0}
+                    badgeCount={
+                      option === "Back filling"
+                        ? (teamNewReferrals["Referral Officer"] ?? []).length
+                        : 0
+                    }
+                    index={index}
+                    key={option}
+                    label={option}
+                    onClick={() => {
+                      setSelectedDriverAction(option);
+                      setSelectedProcessingAction(
+                        option === "Back filling" ? "New Referral" : null,
+                      );
+                      setSelectedProcessingHistoryAction(null);
+                    }}
+                  />
+                );
+              })}
             </div>
           </>
         ) : isReferralOfficer &&
@@ -6597,6 +6882,86 @@ export default function Home() {
                       title="Attachments"
                     />
 
+                    {selectedHistoryDetail.supportDocRequest && (
+                      <div className="support-doc-request-banner">
+                        <span className="record-status support-doc-requested">
+                          Support Doc Requested
+                        </span>
+                        <p>
+                          <strong>
+                            {selectedHistoryDetail.supportDocRequest.requestedBy}
+                          </strong>{" "}
+                          needs a clearer replacement for{" "}
+                          <strong>
+                            {
+                              selectedHistoryDetail.supportDocRequest
+                                .documentLabel
+                            }
+                          </strong>
+                          .
+                        </p>
+                        <p className="support-doc-request-reason">
+                          {selectedHistoryDetail.supportDocRequest.reason}
+                        </p>
+                      </div>
+                    )}
+
+                    {selectedModule === "Referral Officer" &&
+                      selectedHistoryDetail.supportDocRequest?.documentKey ===
+                        "id-photo" && (
+                        <label className="field file-field sd-slot-requested">
+                          <span>Replace SD-10.1 Tenant ID *</span>
+                          <input
+                            accept="image/*,.pdf"
+                            onChange={(event) => {
+                              const file = event.target.files?.[0] ?? null;
+                              setRoIntakeReplacementFiles((prev) => ({
+                                ...prev,
+                                [selectedHistoryDetail.id]: {
+                                  ...prev[selectedHistoryDetail.id],
+                                  idPhoto: file,
+                                },
+                              }));
+                            }}
+                            type="file"
+                          />
+                          <small>
+                            {roIntakeReplacementFiles[selectedHistoryDetail.id]
+                              ?.idPhoto
+                              ? `Selected: ${roIntakeReplacementFiles[selectedHistoryDetail.id]?.idPhoto?.name}`
+                              : "Upload a readable Tenant ID photo or scan."}
+                          </small>
+                        </label>
+                      )}
+
+                    {selectedModule === "Referral Officer" &&
+                      selectedHistoryDetail.supportDocRequest?.documentKey ===
+                        "proof-of-income" && (
+                        <label className="field file-field sd-slot-requested">
+                          <span>Replace proof of income *</span>
+                          <input
+                            accept="image/*,.pdf"
+                            onChange={(event) => {
+                              const file = event.target.files?.[0] ?? null;
+                              setRoIntakeReplacementFiles((prev) => ({
+                                ...prev,
+                                [selectedHistoryDetail.id]: {
+                                  ...prev[selectedHistoryDetail.id],
+                                  proofOfIncome: file,
+                                },
+                              }));
+                            }}
+                            type="file"
+                          />
+                          <small>
+                            {roIntakeReplacementFiles[selectedHistoryDetail.id]
+                              ?.proofOfIncome
+                              ? `Selected: ${roIntakeReplacementFiles[selectedHistoryDetail.id]?.proofOfIncome?.name}`
+                              : "Upload a readable proof of income document."}
+                          </small>
+                        </label>
+                      )}
+
                     {selectedModule === "Referral Officer" && (() => {
                       const savedPaths =
                         selectedHistoryDetail.sdDocumentPaths ?? [];
@@ -6645,9 +7010,14 @@ export default function Home() {
                               const savedPath = savedPaths[slotIndex];
                               const pickedFile = picked[slotIndex];
                               const isReady = Boolean(pickedFile || savedPath);
+                              const isRequested =
+                                selectedHistoryDetail.supportDocRequest
+                                  ?.documentKey === `sd-${slotIndex}`;
                               return (
                                 <label
-                                  className={`sd-slot${isReady ? " ready" : ""}`}
+                                  className={`sd-slot${isReady ? " ready" : ""}${
+                                    isRequested ? " sd-slot-requested" : ""
+                                  }`}
                                   key={slot.code}
                                 >
                                   {renderSdSlotLabel(slot)}
@@ -6685,8 +7055,50 @@ export default function Home() {
                       );
                     })()}
 
+                    {selectedModule &&
+                      teamReturnsDocRequestToReferralOfficer(selectedModule) && (
+                        <fieldset className="support-doc-picker">
+                          <legend>Which document needs to be corrected?</legend>
+                          <div className="support-doc-picker-grid">
+                            {getAwaitingInfoDocumentOptions().map((option) => {
+                              const pickerKey = `${selectedModule}-${selectedHistoryDetail.id}`;
+                              const isSelected =
+                                teamAwaitingDocumentKeys[pickerKey] ===
+                                option.key;
+                              return (
+                                <label
+                                  className={`support-doc-picker-option${
+                                    isSelected ? " selected" : ""
+                                  }`}
+                                  key={option.key}
+                                >
+                                  <input
+                                    checked={isSelected}
+                                    name={pickerKey}
+                                    onChange={() =>
+                                      setTeamAwaitingDocumentKeys((keys) => ({
+                                        ...keys,
+                                        [pickerKey]: option.key,
+                                      }))
+                                    }
+                                    type="radio"
+                                    value={option.key}
+                                  />
+                                  <span>{option.label}</span>
+                                </label>
+                              );
+                            })}
+                          </div>
+                        </fieldset>
+                      )}
+
                     <label className="field">
-                      <span>Cancellation reason</span>
+                      <span>
+                        {selectedModule &&
+                        teamReturnsDocRequestToReferralOfficer(selectedModule)
+                          ? "Reason for document request"
+                          : "Cancellation reason"}
+                      </span>
                       <textarea
                         onChange={(event) =>
                           setTeamRejectionReasons((reasons) => ({
@@ -6695,7 +7107,16 @@ export default function Home() {
                               event.target.value,
                           }))
                         }
-                        placeholder="Required for awaiting info or cancelled"
+                        placeholder={
+                          selectedModule &&
+                          teamReturnsDocRequestToReferralOfficer(
+                            selectedModule,
+                          )
+                            ? "Explain what is wrong (e.g. blurry, wrong page, missing signature)"
+                            : selectedModule === "Tenants Management"
+                              ? "Required for cancelled"
+                              : "Required for awaiting info or cancelled"
+                        }
                         rows={3}
                         value={
                           teamRejectionReasons[
@@ -6707,6 +7128,11 @@ export default function Home() {
 
                     {(() => {
                       const isRO = selectedModule === "Referral Officer";
+                      const awaitingPickerKey = `${selectedModule}-${selectedHistoryDetail.id}`;
+                      const needsDocPick = Boolean(
+                        selectedModule &&
+                          teamReturnsDocRequestToReferralOfficer(selectedModule),
+                      );
                       const savedPaths =
                         selectedHistoryDetail.sdDocumentPaths ?? [];
                       const picked =
@@ -6752,24 +7178,28 @@ export default function Home() {
                       >
                         {isRO && isSdUploading ? "Uploading..." : "Uploaded"}
                       </button>
-                      <button
-                        className="secondary-button dark-secondary-button"
-                        disabled={
-                          !teamRejectionReasons[
-                            `${selectedModule}-${selectedHistoryDetail.id}`
-                          ]?.trim()
-                        }
-                        onClick={() =>
-                          void completeTeamReferral(
-                            selectedModule ?? "",
-                            selectedHistoryDetail,
-                            "awaiting-information",
-                          )
-                        }
-                        type="button"
-                      >
-                        Awaiting information
-                      </button>
+                      {selectedModule !== "Tenants Management" && (
+                        <button
+                          className="secondary-button dark-secondary-button"
+                          disabled={
+                            !teamRejectionReasons[awaitingPickerKey]?.trim() ||
+                            (needsDocPick &&
+                              !teamAwaitingDocumentKeys[awaitingPickerKey])
+                          }
+                          onClick={() =>
+                            void completeTeamReferral(
+                              selectedModule ?? "",
+                              selectedHistoryDetail,
+                              "awaiting-information",
+                            )
+                          }
+                          type="button"
+                        >
+                          {needsDocPick
+                            ? "Request support doc from Referral Officer"
+                            : "Awaiting information"}
+                        </button>
+                      )}
                       <button
                         className="secondary-button danger-button"
                         disabled={
@@ -6793,20 +7223,19 @@ export default function Home() {
                     })()}
                   </section>
                 )}
-              {(
-                teamNewReferrals[selectedModule ?? ""] ?? []
-              ).filter((record) =>
-                matchesBoardSearch(
-                  "processing-new-referrals",
-                  record.fullName,
-                  record.currentProperty,
-                  record.currentRoomNumber,
-                  record.department,
-                ),
-              ).length === 0 ? (
+              {dedupeByRecordId(teamNewReferrals[selectedModule ?? ""] ?? [])
+                .filter((record) =>
+                  matchesBoardSearch(
+                    "processing-new-referrals",
+                    record.fullName,
+                    record.currentProperty,
+                    record.currentRoomNumber,
+                    record.department,
+                  ),
+                ).length === 0 ? (
                 <p className="empty-records">No new referrals yet.</p>
               ) : (
-                (teamNewReferrals[selectedModule ?? ""] ?? [])
+                dedupeByRecordId(teamNewReferrals[selectedModule ?? ""] ?? [])
                   .filter((record) =>
                     matchesBoardSearch(
                       "processing-new-referrals",
@@ -6821,16 +7250,23 @@ export default function Home() {
                     selectedModule ?? "",
                     record,
                   );
+                  const queueRowKey = `${selectedModule ?? "team"}-${record.id}`;
                   return (
                     <button
-                      className={`history-row queue-row ${
-                        sla.level === "overdue" ? "urgent-record" : ""
-                      }`}
-                      key={record.id}
+                      className={`history-row queue-row${
+                        record.supportDocRequest ? " support-doc-request-row" : ""
+                      } ${sla.level === "overdue" ? "urgent-record" : ""}`}
+                      key={queueRowKey}
                       onClick={() => goForward(() => setSelectedHistoryDetail(record))}
                       type="button"
                     >
-                      <span className="record-status driver">New referral</span>
+                      {record.supportDocRequest ? (
+                        <span className="record-status support-doc-requested">
+                          Support Doc Requested
+                        </span>
+                      ) : (
+                        <span className="record-status driver">New referral</span>
+                      )}
                       <strong>{record.fullName}</strong>
                       <span className={`sla-badge ${sla.level}`}>
                         {sla.label}

@@ -14,6 +14,14 @@ export type ReferralStatus =
   | "secured"
   | "viewing-ended";
 
+export type SupportDocRequest = {
+  documentKey: string;
+  documentLabel: string;
+  reason: string;
+  requestedBy: string;
+  requestedAt: Date;
+};
+
 export type ReferralRecord = {
   id: number;
   mondayItemId?: string;
@@ -52,6 +60,7 @@ export type ReferralRecord = {
   proofOfIncomePath?: string;
   signaturePhotoPath?: string;
   sdDocumentPaths?: string[];
+  supportDocRequest?: SupportDocRequest;
   createdAt: Date;
 };
 
