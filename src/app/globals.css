@@ -1376,6 +1376,12 @@ body:has(.module-shell > .module-grid) .hero-badge small {
   font-weight: 600;
 }
 
+.record-status.handed-off {
+  background: var(--success-soft);
+  color: var(--success);
+  font-weight: 600;
+}
+
 .record-status.uploaded {
   background: var(--success-soft);
   color: #4ade80;

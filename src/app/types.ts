@@ -10,6 +10,7 @@ export type ReferralStatus =
   | "failed"
   | "follow-up"
   | "driver"
+  | "handed-off"
   | "secured"
   | "viewing-ended";
 

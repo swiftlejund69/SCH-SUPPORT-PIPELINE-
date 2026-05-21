@@ -98,6 +98,38 @@ export function isFollowUpDeadlinePassed(
   return now.getTime() > getFollowUpDeadline(createdAt).getTime();
 }
 
+export type UkNiValidationResult =
+  | { valid: true; normalized: string }
+  | { valid: false; message: string };
+
+/** UK National Insurance number (e.g. QQ123456C). */
+export function validateUkNiNumber(raw: string): UkNiValidationResult {
+  const normalized = raw.replace(/\s+/g, "").toUpperCase();
+
+  if (!normalized) {
+    return { valid: false, message: "NI Number is required." };
+  }
+
+  if (!/^[A-CEGHJ-PR-TW-Z]{2}\d{6}[A-D]$/i.test(normalized)) {
+    return {
+      valid: false,
+      message:
+        "Enter a valid UK NI number (2 letters, 6 digits, 1 letter — e.g. QQ123456C).",
+    };
+  }
+
+  const prefix = normalized.slice(0, 2);
+  const invalidPrefixes = ["BG", "GB", "KN", "NK", "NT", "TN", "ZZ"];
+  if (invalidPrefixes.includes(prefix)) {
+    return {
+      valid: false,
+      message: "This prefix is not used for UK NI numbers.",
+    };
+  }
+
+  return { valid: true, normalized };
+}
+
 export function isFollowUpDocumentsPending(record: {
   niNumber?: string;
   incomeAmount?: string;

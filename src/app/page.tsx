@@ -38,6 +38,7 @@ import {
   getReminderDates,
   isFollowUpDeadlinePassed,
   isFollowUpDocumentsPending,
+  validateUkNiNumber,
   validateUkPhoneNumber,
 } from "./utils";
 import { BackButton } from "./components/BackButton";
@@ -285,8 +286,8 @@ export default function Home() {
   const [dateOfBirth, setDateOfBirth] = useState("");
   const [tenantType, setTenantType] = useState("");
   const [familyMembersBelow10, setFamilyMembersBelow10] = useState("");
-  const [proofMethod, setProofMethod] = useState("upload");
   const [niNumber, setNiNumber] = useState("");
+  const [niNumberError, setNiNumberError] = useState<string | null>(null);
   const [incomeAmount, setIncomeAmount] = useState("");
   const [leaverName, setLeaverName] = useState("");
   const [leaverPropertyAddress, setLeaverPropertyAddress] = useState("");
@@ -733,8 +734,8 @@ export default function Home() {
     setDateOfBirth("");
     setTenantType("");
     setFamilyMembersBelow10("");
-    setProofMethod("upload");
     setNiNumber("");
+    setNiNumberError(null);
     setIncomeAmount("");
     setEditingFollowUpId(null);
     setEligibilityResult(null);
@@ -1236,8 +1237,14 @@ export default function Home() {
 
       if (record.status === "follow-up") {
         loadedFollowUps.push(record);
-      } else if (record.status === "driver") {
+      } else if (
+        record.status === "driver" ||
+        record.status === "handed-off"
+      ) {
         loadedDriverQueue.push(record);
+        if (record.status === "handed-off") {
+          loadedHistory.push(record);
+        }
       } else if (
         record.status === "failed" ||
         record.status === "secured" ||
@@ -1600,12 +1607,12 @@ export default function Home() {
     setReferralType(record.referralType);
     setReferralOfficer(record.referralOfficer);
     setNiNumber(record.niNumber);
+    setNiNumberError(null);
     setIncomeAmount(record.incomeAmount);
     setDateOfBirth(record.dateOfBirth);
     setTenantType(record.tenantType ?? "");
     setFamilyMembersBelow10(record.familyMembersBelow10);
     clearReferralFileInputs();
-    setProofMethod("upload");
     setReferralStep(1);
     setSelectedReceptionAction("New Referral");
     setEligibilityResult(null);
@@ -3084,7 +3091,33 @@ export default function Home() {
       return "Follow up";
     }
 
+    if (record.status === "handed-off") {
+      return "Passed to Referral Officer";
+    }
+
+    if (record.status === "driver") {
+      return "With driver";
+    }
+
     return record.status === "failed" ? "Failed" : "Passed";
+  }
+
+  function collectReferralOfficerHistoryRecords(): TeamReferralRecord[] {
+    const completed = teamHistory["Referral Officer"] ?? [];
+    const inProgress = (teamNewReferrals["Referral Officer"] ?? []).filter(
+      (record) => (record.sdDocumentPaths ?? []).some((path) => Boolean(path)),
+    );
+    const seen = new Set<number>();
+
+    return sortHistoryByNewestFirst(
+      [...completed, ...inProgress].filter((record) => {
+        if (seen.has(record.id)) {
+          return false;
+        }
+        seen.add(record.id);
+        return true;
+      }),
+    );
   }
 
   function getRecordTitle(
@@ -4713,20 +4746,27 @@ export default function Home() {
 
     if (!niNumber.trim()) {
       const reason = "NI Number is required.";
-      failureReasons.push(reason);
       documentFailureReasons.push(reason);
+    } else {
+      const niCheck = validateUkNiNumber(niNumber);
+      if (!niCheck.valid) {
+        setNiNumberError(niCheck.message);
+        toast.error("Invalid NI number", { description: niCheck.message });
+        return;
+      }
+      setNiNumberError(null);
+      setNiNumber(niCheck.normalized);
     }
 
     if (Number(incomeAmount) <= 0) {
       const reason = "Proof of income amount must be above £0.";
-      failureReasons.push(reason);
       documentFailureReasons.push(reason);
     }
 
     if (!idPhotoFile && !existingFollowUp?.idPhotoPath) {
-      const reason = "SD-10.1 Tenant ID is required.";
-      failureReasons.push(reason);
-      documentFailureReasons.push(reason);
+      documentFailureReasons.push(
+        "SD-10.1 Tenant ID not provided — add in Follow ups.",
+      );
     }
 
     if (!proofOfIncomeFile && !existingFollowUp?.proofOfIncomePath) {
@@ -4748,8 +4788,12 @@ export default function Home() {
       return { ...record, ...paths };
     }
 
-    if (failureReasons.length === 0) {
-      let record = buildReferralRecordFromForm("driver", [], existingFollowUp);
+    if (failureReasons.length === 0 && documentFailureReasons.length === 0) {
+      let record = buildReferralRecordFromForm(
+        "handed-off",
+        [],
+        existingFollowUp,
+      );
       try {
         record = await mergeUploaded(record);
       } catch {
@@ -4760,6 +4804,7 @@ export default function Home() {
         records.filter((followUp) => followUp.id !== editingFollowUpId),
       );
       setDriverQueue((records) => [record, ...records]);
+      setHistory((records) => sortHistoryByNewestFirst([record, ...records]));
       void saveReferralRecord(record);
       setEditingFollowUpId(null);
       setPassedReferralOfficer(
@@ -4771,7 +4816,7 @@ export default function Home() {
         reasons: [],
       });
       toast.success("Referral submitted", {
-        description: `${record.fullName} sent to Referral Officer queue`,
+        description: `${record.fullName} sent to Referral Officer and saved to History`,
       });
       return;
     }
@@ -4829,7 +4874,7 @@ export default function Home() {
         reasons: documentFailureReasons,
         title: "Moved to Follow ups",
         message:
-          "This referral needs NI Number or proof of income follow-up. Two reminders are scheduled on days 2 and 4. If documents are not received by the deadline, the referral is cancelled automatically.",
+          "This referral is missing NI Number, Tenant ID, and/or proof of income. Two reminders are scheduled on days 2 and 4. If documents are not received by the deadline, the referral is cancelled automatically.",
       });
       return;
     }
@@ -5919,48 +5964,51 @@ export default function Home() {
             </button>
             <div className="records-heading">
               <h2>Referral Officer History</h2>
-              <p>Completed incoming referrals are stored here.</p>
+              <p>
+                Back filling work and uploaded supporting documents (reception
+                attachments and SD files).
+              </p>
             </div>
             <div className="records-list">
-              {selectedHistoryDetail && (
+              {selectedHistoryDetail &&
+                "fullName" in selectedHistoryDetail &&
+                "department" in selectedHistoryDetail && (
                 <HistoryDetailPanel
                   details={formatFullHistoryDetails(selectedHistoryDetail)}
                   onAction={() => setSelectedHistoryDetail(null)}
                   title={getRecordTitle(selectedHistoryDetail)}
                 >
                   <RecordMediaGallery
-                    items={getRecordMediaItems(selectedHistoryDetail)}
-                    title="Attachments"
+                    items={getRecordMediaItems(
+                      selectedHistoryDetail,
+                      "Referral Officer",
+                    )}
+                    title="All uploaded documents"
                   />
                 </HistoryDetailPanel>
               )}
-              {history.filter(
-                (record) =>
-                  record.status === "secured" ||
-                  record.status === "viewing-ended",
-              ).length === 0 ? (
+              {collectReferralOfficerHistoryRecords().length === 0 ? (
                 <p className="empty-records">No referral officer history yet.</p>
               ) : (
-                sortHistoryByNewestFirst(
-                  history.filter(
-                    (record) =>
-                      record.status === "secured" ||
-                      record.status === "viewing-ended",
-                  ),
-                ).map((record) => (
+                collectReferralOfficerHistoryRecords().map((record) => (
                     <button
                       className="history-row"
-                      key={record.id}
+                      key={`ro-history-${record.id}`}
                       onClick={() => goForward(() => setSelectedHistoryDetail(record))}
                       type="button"
                     >
-                      <span className={`record-status ${record.status}`}>
+                      <span
+                        className={`record-status ${
+                          record.teamOutcome ?? "driver"
+                        }`}
+                      >
                         {getHistoryStatusLabel(record)}
                       </span>
                       <strong>{record.fullName}</strong>
                       <small>
                         {formatSecuredProperty(record)} |{" "}
-                        {record.phoneNumber || "No phone"}
+                        {(record.sdDocumentPaths ?? []).filter(Boolean).length}{" "}
+                        SD file(s) on record
                       </small>
                     </button>
                   ))
@@ -6878,8 +6926,13 @@ export default function Home() {
                       value={formatFullHistoryDetails(selectedHistoryDetail)}
                     />
                     <RecordMediaGallery
-                      items={getRecordMediaItems(selectedHistoryDetail)}
-                      title="Attachments"
+                      items={getRecordMediaItems(
+                        selectedHistoryDetail,
+                        selectedModule === "Referral Officer"
+                          ? "Referral Officer"
+                          : selectedModule,
+                      )}
+                      title="All uploaded documents"
                     />
                   </section>
                 )}
@@ -9366,7 +9419,10 @@ export default function Home() {
             </button>
             <div className="records-heading">
               <h2>History</h2>
-              <p>Passed and failed referrals are stored here.</p>
+              <p>
+                Passed to Referral Officer, failed, secured, and other closed
+                referrals are stored here.
+              </p>
             </div>
             <div className="records-list">
               {selectedHistoryDetail && (
@@ -9739,19 +9795,47 @@ export default function Home() {
                 </div>
 
                 <div className="form-grid">
-                  <label className="field">
-                    <span>NI Number</span>
+                  <label
+                    className={`field${niNumberError ? " field-invalid" : ""}`}
+                  >
+                    <span>NI Number *</span>
                     <input
-                      onChange={(event) => setNiNumber(event.target.value)}
-                      placeholder="Enter NI number"
+                      aria-invalid={niNumberError ? true : undefined}
+                      onBlur={() => {
+                        if (!niNumber.trim()) {
+                          setNiNumberError(null);
+                          return;
+                        }
+                        const result = validateUkNiNumber(niNumber);
+                        setNiNumberError(result.valid ? null : result.message);
+                        if (result.valid) {
+                          setNiNumber(result.normalized);
+                        }
+                      }}
+                      onChange={(event) => {
+                        setNiNumber(event.target.value);
+                        if (niNumberError) {
+                          setNiNumberError(null);
+                        }
+                      }}
+                      placeholder="e.g. QQ123456C"
                       type="text"
                       value={niNumber}
                     />
+                    {niNumberError ? (
+                      <small className="field-hint field-hint-error">
+                        {niNumberError}
+                      </small>
+                    ) : (
+                      <small className="field-hint">
+                        UK format: 2 letters, 6 digits, 1 letter
+                      </small>
+                    )}
                   </label>
 
                   <label className="field file-field">
                     <span>
-                      SD-10.1 Tenant ID *
+                      SD-10.1 Tenant ID
                       {editingFollowUpRecord?.idPhotoPath ? " (on file)" : ""}
                     </span>
                     <input
@@ -9761,7 +9845,6 @@ export default function Home() {
                       onChange={(event) =>
                         setIdPhotoFile(event.target.files?.[0] ?? null)
                       }
-                      required={!editingFollowUpRecord?.idPhotoPath}
                       type="file"
                     />
                     <small>
@@ -9769,47 +9852,20 @@ export default function Home() {
                         ? `Selected: ${idPhotoFile.name}`
                         : editingFollowUpRecord?.idPhotoPath
                           ? "Already uploaded — choose a new file only to replace it."
-                          : "Use the camera to take a photo of the tenant ID."}
+                          : "Optional — if not provided, referral goes to Follow ups."}
                     </small>
                   </label>
 
-                  <div className="field field-wide">
-                    <span>Proof of Income</span>
-                    <div className="radio-row compact">
-                      <label className="choice-card">
-                        <input
-                          checked={proofMethod === "upload"}
-                          name="proofMethod"
-                          onChange={() => setProofMethod("upload")}
-                          type="radio"
-                          value="upload"
-                        />
-                        Upload picture
-                      </label>
-                      <label className="choice-card">
-                        <input
-                          checked={proofMethod === "camera"}
-                          name="proofMethod"
-                          onChange={() => setProofMethod("camera")}
-                          type="radio"
-                          value="camera"
-                        />
-                        Take picture
-                      </label>
-                    </div>
-                  </div>
-
                   <label className="field file-field">
                     <span>
-                      {proofMethod === "camera"
-                        ? "Take proof of income photo"
-                        : "Upload proof of income picture"}
+                      Proof of income
+                      {editingFollowUpRecord?.proofOfIncomePath
+                        ? " (on file)"
+                        : ""}
                     </span>
                     <input
                       accept="image/*,.pdf"
-                      capture={
-                        proofMethod === "camera" ? "environment" : undefined
-                      }
+                      capture="environment"
                       key={`referral-proof-${referralFileInputKey}`}
                       onChange={(event) =>
                         setProofOfIncomeFile(event.target.files?.[0] ?? null)
@@ -9820,8 +9876,8 @@ export default function Home() {
                       {proofOfIncomeFile
                         ? `Selected: ${proofOfIncomeFile.name}`
                         : editingFollowUpRecord?.proofOfIncomePath
-                          ? "Proof of income already uploaded — choose a new file only to replace it."
-                          : "Upload or take a photo of proof of income."}
+                          ? "Already uploaded — choose a new file only to replace it."
+                          : "Upload proof of income document or photo."}
                     </small>
                   </label>
 
