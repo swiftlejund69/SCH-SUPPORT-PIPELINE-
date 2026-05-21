@@ -1,3 +1,60 @@
+export type UkPhoneValidationResult =
+  | { valid: true; normalized: string; display: string }
+  | { valid: false; message: string };
+
+/** Strip spaces/dashes and validate UK mobile or landline (0… or +44…). */
+export function validateUkPhoneNumber(raw: string): UkPhoneValidationResult {
+  const trimmed = raw.trim();
+  if (!trimmed) {
+    return { valid: false, message: "Phone number is required." };
+  }
+
+  let digits = trimmed.replace(/[\s().-]/g, "");
+  if (digits.startsWith("+44")) {
+    digits = `0${digits.slice(3)}`;
+  } else if (digits.startsWith("0044")) {
+    digits = `0${digits.slice(4)}`;
+  } else if (digits.startsWith("44") && digits.length >= 12) {
+    digits = `0${digits.slice(2)}`;
+  }
+
+  digits = digits.replace(/\D/g, "");
+
+  if (!digits.startsWith("0")) {
+    return {
+      valid: false,
+      message: "Enter a valid UK number starting with 0 or +44.",
+    };
+  }
+
+  const ukPatterns = [
+    /^07\d{9}$/,
+    /^01\d{8,9}$/,
+    /^02\d{8,9}$/,
+    /^03\d{8,9}$/,
+    /^080\d{6,7}$/,
+    /^084\d{7}$/,
+  ];
+
+  if (!ukPatterns.some((pattern) => pattern.test(digits))) {
+    return {
+      valid: false,
+      message: "Enter a valid UK mobile or landline (e.g. 07XXX XXXXXX).",
+    };
+  }
+
+  let display = digits;
+  if (/^07\d{9}$/.test(digits)) {
+    display = `${digits.slice(0, 5)} ${digits.slice(5)}`;
+  } else if (digits.length === 11) {
+    display = `${digits.slice(0, 4)} ${digits.slice(4, 7)} ${digits.slice(7)}`;
+  } else if (digits.length === 10) {
+    display = `${digits.slice(0, 3)} ${digits.slice(3, 6)} ${digits.slice(6)}`;
+  }
+
+  return { valid: true, normalized: digits, display };
+}
+
 export function calculateAge(dateOfBirth: string) {
   if (!dateOfBirth) {
     return "";
@@ -24,6 +81,35 @@ export function getReminderDates(createdAt: Date) {
     reminderDate.setDate(reminderDate.getDate() + days);
     return reminderDate;
   });
+}
+
+/** End of the last reminder day (day 4 after creation). */
+export function getFollowUpDeadline(createdAt: Date) {
+  const reminders = getReminderDates(createdAt);
+  const deadline = new Date(reminders[reminders.length - 1] ?? createdAt);
+  deadline.setHours(23, 59, 59, 999);
+  return deadline;
+}
+
+export function isFollowUpDeadlinePassed(
+  createdAt: Date,
+  now: Date = new Date(),
+) {
+  return now.getTime() > getFollowUpDeadline(createdAt).getTime();
+}
+
+export function isFollowUpDocumentsPending(record: {
+  niNumber?: string;
+  incomeAmount?: string;
+  idPhotoPath?: string;
+  proofOfIncomePath?: string;
+}) {
+  const hasNi = Boolean(record.niNumber?.trim());
+  const hasIncome = Number(record.incomeAmount) > 0;
+  const hasIdPhoto = Boolean(record.idPhotoPath);
+  const hasProofFile = Boolean(record.proofOfIncomePath);
+
+  return !hasNi || !hasIncome || !hasIdPhoto || !hasProofFile;
 }
 
 export function formatDisplayDate(value?: string | Date | null) {

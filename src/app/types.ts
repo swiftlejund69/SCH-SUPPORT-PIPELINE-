@@ -22,6 +22,7 @@ export type ReferralRecord = {
   niNumber: string;
   incomeAmount: string;
   phoneNumber: string;
+  tenantType?: string;
   familyMembersBelow10: string;
   referralType: string;
   referralOfficer: string;

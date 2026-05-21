@@ -55,12 +55,13 @@ export function RecordMediaGallery({
       if (cancelled) {
         return;
       }
-      const byKey = new Map(signed.map((entry) => [entry.path, entry.url]));
       const next: ResolvedItem[] = [];
       items.forEach((item) => {
-        const url = byKey.get(item.path);
-        if (url) {
-          next.push({ ...item, url });
+        const match = signed.find(
+          (entry) => entry.bucket === item.bucket && entry.path === item.path,
+        );
+        if (match?.url) {
+          next.push({ ...item, url: match.url });
         }
       });
       setResolved(next);

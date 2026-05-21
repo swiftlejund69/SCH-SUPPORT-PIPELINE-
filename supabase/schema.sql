@@ -145,6 +145,10 @@ add column if not exists inspection_report jsonb;
 notify pgrst, 'reload schema';
 
 alter table public.referrals
+add column if not exists follow_up_reasons text[] default '{}',
+add column if not exists tenant_type text;
+
+alter table public.referrals
 add column if not exists support_worker text,
 add column if not exists assigned_to text,
 add column if not exists assigned_by text,

@@ -33,8 +33,12 @@ import type {
 import {
   calculateAge,
   formatDisplayDate,
+  getFollowUpDeadline,
   getInitials,
   getReminderDates,
+  isFollowUpDeadlinePassed,
+  isFollowUpDocumentsPending,
+  validateUkPhoneNumber,
 } from "./utils";
 import { BackButton } from "./components/BackButton";
 import { HistoryDetailPanel } from "./components/HistoryDetailPanel";
@@ -57,6 +61,12 @@ import {
 } from "../lib/download-referral-documents";
 import { downloadInspectionDocumentsZip } from "../lib/download-inspection-documents";
 import { getInitialTheme, LOGIN_THEME } from "../lib/theme";
+import {
+  isMissingFollowUpColumnsError,
+  packFollowUpHandoffNotes,
+  stripFollowUpMetaFromHandoff,
+  unpackFollowUpFromHandoff,
+} from "../lib/referral-follow-up-meta";
 
 type SupabaseReferralRow = {
   app_record_id: number;
@@ -90,6 +100,8 @@ type SupabaseReferralRow = {
   handoff_notes: string | null;
   timeline_end: string | null;
   monday_status: string | null;
+  follow_up_reasons: string[] | null;
+  tenant_type: string | null;
   created_at: string;
 };
 
@@ -269,6 +281,7 @@ export default function Home() {
   const [referralOfficer, setReferralOfficer] = useState("");
   const [fullName, setFullName] = useState("");
   const [phoneNumber, setPhoneNumber] = useState("");
+  const [phoneNumberError, setPhoneNumberError] = useState<string | null>(null);
   const [dateOfBirth, setDateOfBirth] = useState("");
   const [tenantType, setTenantType] = useState("");
   const [familyMembersBelow10, setFamilyMembersBelow10] = useState("");
@@ -340,6 +353,7 @@ export default function Home() {
   >({});
   const [idPhotoFile, setIdPhotoFile] = useState<File | null>(null);
   const [proofOfIncomeFile, setProofOfIncomeFile] = useState<File | null>(null);
+  const [referralFileInputKey, setReferralFileInputKey] = useState(0);
   const [sdDocumentFiles, setSdDocumentFiles] = useState<
     Record<number, (File | null)[]>
   >({});
@@ -441,6 +455,15 @@ export default function Home() {
   const isInspector = selectedModule === "Inspector";
   const inspectorName = "Inspector";
   const nowMs = useNowTick(60_000);
+
+  const editingFollowUpRecord = useMemo(
+    () =>
+      editingFollowUpId
+        ? (followUps.find((record) => record.id === editingFollowUpId) ?? null)
+        : null,
+    [editingFollowUpId, followUps],
+  );
+
   const isProcessingModule = selectedModule
     ? processingModules.includes(selectedModule)
     : false;
@@ -672,12 +695,41 @@ export default function Home() {
     };
   }, [currentProfile]);
 
+  useEffect(() => {
+    if (!currentProfile || followUps.length === 0) {
+      return;
+    }
+
+    const { active, cancelled } = partitionExpiredFollowUps(followUps);
+    if (cancelled.length === 0) {
+      return;
+    }
+
+    cancelled.forEach((record) => {
+      void saveReferralRecord(record);
+    });
+    setFollowUps(active);
+    setHistory((records) =>
+      sortHistoryByNewestFirst([...cancelled, ...records]),
+    );
+    toast.info(
+      cancelled.length === 1
+        ? "Follow-up cancelled"
+        : `${cancelled.length} follow-ups cancelled`,
+      {
+        description:
+          "The deadline passed without documents. Moved to History as failed.",
+      },
+    );
+  }, [nowMs, currentProfile, followUps]);
+
   function resetReferralForm() {
     setReferralStep(1);
     setReferralType("walk-in");
     setReferralOfficer("");
     setFullName("");
     setPhoneNumber("");
+    setPhoneNumberError(null);
     setDateOfBirth("");
     setTenantType("");
     setFamilyMembersBelow10("");
@@ -688,8 +740,13 @@ export default function Home() {
     setEligibilityResult(null);
     setPassedReferralOfficer("");
     setPassedReferralId(null);
+    clearReferralFileInputs();
+  }
+
+  function clearReferralFileInputs() {
     setIdPhotoFile(null);
     setProofOfIncomeFile(null);
+    setReferralFileInputKey((key) => key + 1);
   }
 
   function resetLeaverForm() {
@@ -720,6 +777,25 @@ export default function Home() {
 
   function addRecordToMap<T>(map: Record<string, T[]>, key: string, record: T) {
     map[key] = [record, ...(map[key] ?? [])];
+  }
+
+  function sortHistoryByNewestFirst<T extends { createdAt: Date }>(
+    records: readonly T[],
+  ): T[] {
+    return [...records].sort(
+      (a, b) => b.createdAt.getTime() - a.createdAt.getTime(),
+    );
+  }
+
+  function sortHistoryMapByNewestFirst<T extends { createdAt: Date }>(
+    map: Record<string, T[]>,
+  ): Record<string, T[]> {
+    return Object.fromEntries(
+      Object.entries(map).map(([key, records]) => [
+        key,
+        sortHistoryByNewestFirst(records),
+      ]),
+    );
   }
 
   function isTodayOrOverdue(date?: string) {
@@ -894,6 +970,12 @@ export default function Home() {
   }
 
   function mapReferralRow(record: SupabaseReferralRow): ReferralRecord {
+    const followUpFromHandoff = unpackFollowUpFromHandoff(record.handoff_notes);
+    const reasonsFromColumn =
+      record.follow_up_reasons && record.follow_up_reasons.length > 0
+        ? record.follow_up_reasons
+        : [];
+
     return {
       id: record.app_record_id,
       mondayItemId: record.monday_item_id ?? undefined,
@@ -903,8 +985,13 @@ export default function Home() {
       niNumber: record.ni_number ?? "",
       incomeAmount: record.income_amount?.toString() ?? "",
       phoneNumber: record.phone_number ?? "",
+      tenantType: record.tenant_type ?? followUpFromHandoff.tenantType,
       familyMembersBelow10: record.family_members_below_10?.toString() ?? "",
       referralType: record.referral_type ?? "walk-in",
+      reasons:
+        reasonsFromColumn.length > 0
+          ? reasonsFromColumn
+          : followUpFromHandoff.reasons,
       referralOfficer: record.referral_officer ?? "",
       supportWorker: record.support_worker ?? undefined,
       driverAccepted: record.driver_status !== "driver",
@@ -914,7 +1001,6 @@ export default function Home() {
       rejectedPropertyCount: 0,
       rejectionReason: "",
       status: record.driver_status ?? "driver",
-      reasons: [],
       assignedTo: record.assigned_to ?? undefined,
       assignedBy: record.assigned_by ?? undefined,
       assignedAt: record.assigned_at ? new Date(record.assigned_at) : undefined,
@@ -926,7 +1012,8 @@ export default function Home() {
       proofOfIncomePath: record.proof_of_income_path ?? undefined,
       signaturePhotoPath: record.signature_photo_path ?? undefined,
       sdDocumentPaths: record.sd_document_paths ?? undefined,
-      handoffNotes: record.handoff_notes ?? undefined,
+      handoffNotes:
+        stripFollowUpMetaFromHandoff(record.handoff_notes) || undefined,
       timelineEnd: record.timeline_end ?? undefined,
       mondayStatus: record.monday_status ?? undefined,
       referralOfficerStatus: record.referral_officer_status,
@@ -1216,11 +1303,20 @@ export default function Home() {
       }
     });
 
-    setFollowUps(loadedFollowUps);
+    const { active: activeFollowUps, cancelled: expiredFollowUps } =
+      partitionExpiredFollowUps(loadedFollowUps);
+    expiredFollowUps.forEach((record) => {
+      void saveReferralRecord(record);
+    });
+    if (expiredFollowUps.length > 0) {
+      loadedHistory.push(...expiredFollowUps);
+    }
+
+    setFollowUps(sortHistoryByNewestFirst(activeFollowUps));
     setDriverQueue(loadedDriverQueue);
-    setHistory(loadedHistory);
+    setHistory(sortHistoryByNewestFirst(loadedHistory));
     setTeamNewReferrals(loadedTeamQueues);
-    setTeamHistory(loadedTeamHistory);
+    setTeamHistory(sortHistoryMapByNewestFirst(loadedTeamHistory));
   }
 
   function hydrateLeaverRecords(records: SupabaseLeaverRow[]) {
@@ -1297,14 +1393,16 @@ export default function Home() {
       }
     });
 
-    setSupportLeaverHistory(loadedSupportHistory);
+    setSupportLeaverHistory(sortHistoryByNewestFirst(loadedSupportHistory));
     setTeamLeavers(loadedTeamQueues);
-    setTeamLeaverHistory(loadedTeamHistory);
+    setTeamLeaverHistory(sortHistoryMapByNewestFirst(loadedTeamHistory));
     setMaintenancePendingLeavers(loadedMaintenancePending);
     setInspectorLeavers(loadedInspectorQueue);
-    setInspectorHistory((current) => [...loadedInspectorHistory, ...current]);
+    setInspectorHistory((current) =>
+      sortHistoryByNewestFirst([...loadedInspectorHistory, ...current]),
+    );
     setCleanersPendingLeavers(loadedCleanersPending);
-    setCleanersHistoryLeavers(loadedCleanersHistory);
+    setCleanersHistoryLeavers(sortHistoryByNewestFirst(loadedCleanersHistory));
   }
 
   function hydrateTransferRecords(records: SupabaseTransferRow[]) {
@@ -1381,54 +1479,134 @@ export default function Home() {
       }
     });
 
-    setSupportTransferHistory(loadedSupportHistory);
+    setSupportTransferHistory(sortHistoryByNewestFirst(loadedSupportHistory));
     setTeamTransfers(loadedTeamQueues);
-    setTeamTransferHistory(loadedTeamHistory);
+    setTeamTransferHistory(sortHistoryMapByNewestFirst(loadedTeamHistory));
     setMaintenancePendingTransfers(loadedMaintenancePending);
     setInspectorTransfers(loadedInspectorQueue);
-    setInspectorHistory((current) => [...loadedInspectorHistory, ...current]);
+    setInspectorHistory((current) =>
+      sortHistoryByNewestFirst([...loadedInspectorHistory, ...current]),
+    );
     setCleanersPendingTransfers(loadedCleanersPending);
-    setCleanersHistoryTransfers(loadedCleanersHistory);
+    setCleanersHistoryTransfers(sortHistoryByNewestFirst(loadedCleanersHistory));
   }
 
-  function createReferralRecord(
+  function buildReferralRecordFromForm(
     status: ReferralRecord["status"],
     reasons: string[],
+    existing?: ReferralRecord,
   ): ReferralRecord {
+    const phoneCheck = validateUkPhoneNumber(phoneNumber);
+
     return {
-      id: editingFollowUpId ?? Date.now(),
+      id: existing?.id ?? editingFollowUpId ?? Date.now(),
+      mondayItemId: existing?.mondayItemId,
       fullName: fullName.trim() || "Unnamed referral",
       age,
       dateOfBirth,
       niNumber,
       incomeAmount,
-      phoneNumber,
+      phoneNumber: phoneCheck.valid ? phoneCheck.normalized : phoneNumber.trim(),
+      tenantType,
       familyMembersBelow10,
       referralType,
       referralOfficer: referralType === "sourced" ? referralOfficer : "",
-      driverAccepted: false,
-      currentProperty: "",
-      currentRoomNumber: "",
-      propertyAccepted: false,
-      rejectedPropertyCount: 0,
-      rejectionReason: "",
+      handoffNotes: existing?.handoffNotes,
+      driverAccepted: existing?.driverAccepted ?? false,
+      currentProperty: existing?.currentProperty ?? "",
+      currentRoomNumber: existing?.currentRoomNumber ?? "",
+      propertyAccepted: existing?.propertyAccepted ?? false,
+      rejectedPropertyCount: existing?.rejectedPropertyCount ?? 0,
+      rejectionReason: existing?.rejectionReason ?? "",
       status,
       reasons,
-      createdAt: new Date(),
+      idPhotoPath: existing?.idPhotoPath,
+      proofOfIncomePath: existing?.proofOfIncomePath,
+      signaturePhotoPath: existing?.signaturePhotoPath,
+      sdDocumentPaths: existing?.sdDocumentPaths,
+      createdAt: existing?.createdAt ?? new Date(),
     };
   }
 
+  function createReferralRecord(
+    status: ReferralRecord["status"],
+    reasons: string[],
+  ) {
+    return buildReferralRecordFromForm(status, reasons);
+  }
+
+  function cancelExpiredFollowUpRecord(record: ReferralRecord): ReferralRecord {
+    return {
+      ...record,
+      status: "failed",
+      reasons: [
+        ...record.reasons,
+        "Follow-up deadline expired. Documents were not received.",
+      ],
+    };
+  }
+
+  function partitionExpiredFollowUps(records: ReferralRecord[]) {
+    const active: ReferralRecord[] = [];
+    const cancelled: ReferralRecord[] = [];
+
+    records.forEach((record) => {
+      if (
+        isFollowUpDeadlinePassed(record.createdAt) &&
+        isFollowUpDocumentsPending(record)
+      ) {
+        cancelled.push(cancelExpiredFollowUpRecord(record));
+      } else {
+        active.push(record);
+      }
+    });
+
+    return { active, cancelled };
+  }
+
+  async function persistFollowUpDraft(existing: ReferralRecord) {
+    const draft = buildReferralRecordFromForm("follow-up", existing.reasons, existing);
+    setFollowUps((records) =>
+      records.map((record) => (record.id === draft.id ? draft : record)),
+    );
+    await saveReferralRecord(draft);
+    return draft;
+  }
+
   function openFollowUpForEdit(record: ReferralRecord) {
+    if (
+      isFollowUpDeadlinePassed(record.createdAt) &&
+      isFollowUpDocumentsPending(record)
+    ) {
+      const cancelled = cancelExpiredFollowUpRecord(record);
+      setFollowUps((records) =>
+        records.filter((followUp) => followUp.id !== record.id),
+      );
+      setHistory((records) =>
+        sortHistoryByNewestFirst([cancelled, ...records]),
+      );
+      void saveReferralRecord(cancelled);
+      toast.error("Follow-up cancelled", {
+        description:
+          "The deadline has passed and documents were not received. This referral was moved to History as failed.",
+      });
+      return;
+    }
+
     setEditingFollowUpId(record.id);
     setFullName(record.fullName === "Unnamed referral" ? "" : record.fullName);
     setPhoneNumber(record.phoneNumber);
+    setPhoneNumberError(null);
     setReferralType(record.referralType);
     setReferralOfficer(record.referralOfficer);
     setNiNumber(record.niNumber);
     setIncomeAmount(record.incomeAmount);
     setDateOfBirth(record.dateOfBirth);
+    setTenantType(record.tenantType ?? "");
     setFamilyMembersBelow10(record.familyMembersBelow10);
-    setReferralStep(3);
+    clearReferralFileInputs();
+    setProofMethod("upload");
+    setReferralStep(1);
     setSelectedReceptionAction("New Referral");
     setEligibilityResult(null);
   }
@@ -1446,48 +1624,83 @@ export default function Home() {
   }
 
   async function saveReferralRecord(record: ReferralRecord) {
-    const { error } = await supabase.from("referrals").upsert(
-      {
-        app_record_id: record.id,
-        full_name: record.fullName,
-        phone_number: record.phoneNumber || null,
-        date_of_birth: record.dateOfBirth || null,
-        age: parseOptionalInteger(record.age),
-        ni_number: record.niNumber || null,
-        income_amount: parseOptionalMoney(record.incomeAmount),
-        family_members_below_10: parseOptionalInteger(
-          record.familyMembersBelow10,
-        ),
-        referral_type: record.referralType,
-        referral_officer: record.referralOfficer || null,
-        support_worker: record.supportWorker || null,
-        secured_property_address: record.currentProperty || null,
-        secured_room_number: record.currentRoomNumber || null,
-        driver_status: record.status,
-        assigned_to: record.assignedTo || null,
-        assigned_by: record.assignedBy || null,
-        assigned_at: record.assignedAt?.toISOString() ?? null,
-        escalation_count: record.escalationCount ?? 0,
-        escalation_paused_at: record.escalationPausedAt?.toISOString() ?? null,
-        id_photo_path: record.idPhotoPath ?? null,
-        proof_of_income_path: record.proofOfIncomePath ?? null,
-        signature_photo_path: record.signaturePhotoPath ?? null,
-        sd_document_paths: record.sdDocumentPaths ?? null,
-        handoff_notes: record.handoffNotes || null,
-        timeline_end: record.timelineEnd || null,
-        monday_status: record.mondayStatus || null,
-        monday_item_id: record.mondayItemId || null,
-      },
-      { onConflict: "app_record_id" },
-    );
+    const basePayload = {
+      app_record_id: record.id,
+      full_name: record.fullName,
+      phone_number: record.phoneNumber || null,
+      date_of_birth: record.dateOfBirth || null,
+      age: parseOptionalInteger(record.age),
+      ni_number: record.niNumber || null,
+      income_amount: parseOptionalMoney(record.incomeAmount),
+      family_members_below_10: parseOptionalInteger(
+        record.familyMembersBelow10,
+      ),
+      referral_type: record.referralType,
+      referral_officer: record.referralOfficer || null,
+      support_worker: record.supportWorker || null,
+      secured_property_address: record.currentProperty || null,
+      secured_room_number: record.currentRoomNumber || null,
+      driver_status: record.status,
+      assigned_to: record.assignedTo || null,
+      assigned_by: record.assignedBy || null,
+      assigned_at: record.assignedAt?.toISOString() ?? null,
+      escalation_count: record.escalationCount ?? 0,
+      escalation_paused_at: record.escalationPausedAt?.toISOString() ?? null,
+      id_photo_path: record.idPhotoPath ?? null,
+      proof_of_income_path: record.proofOfIncomePath ?? null,
+      signature_photo_path: record.signaturePhotoPath ?? null,
+      sd_document_paths: record.sdDocumentPaths ?? null,
+      timeline_end: record.timelineEnd || null,
+      monday_status: record.mondayStatus || null,
+      monday_item_id: record.mondayItemId || null,
+    };
 
-    if (error) {
-      const info = describeSupabaseError(error);
+    const payloadWithFollowUpColumns = {
+      ...basePayload,
+      follow_up_reasons:
+        record.status === "follow-up" && record.reasons.length > 0
+          ? record.reasons
+          : null,
+      tenant_type: record.tenantType || null,
+      handoff_notes: record.handoffNotes || null,
+    };
+
+    let result = await supabase
+      .from("referrals")
+      .upsert(payloadWithFollowUpColumns, { onConflict: "app_record_id" });
+
+    if (result.error && isMissingFollowUpColumnsError(result.error)) {
+      const fallbackPayload = {
+        ...basePayload,
+        handoff_notes:
+          record.status === "follow-up"
+            ? packFollowUpHandoffNotes(
+                record.handoffNotes,
+                record.reasons,
+                record.tenantType ?? "",
+              )
+            : record.handoffNotes || null,
+      };
+
+      result = await supabase
+        .from("referrals")
+        .upsert(fallbackPayload, { onConflict: "app_record_id" });
+
+      if (!result.error) {
+        toast.warning("Database update recommended", {
+          description:
+            "Follow-up data was saved using a fallback. Run supabase/migrations/20260520_referral_follow_up_columns.sql in the Supabase SQL editor.",
+        });
+      }
+    }
+
+    if (result.error) {
+      const info = describeSupabaseError(result.error);
       console.error(
         "Could not save referral to Supabase",
         info.summary,
         info.detail,
-        error,
+        result.error,
       );
       toast.error("Could not save referral", { description: info.summary });
     }
@@ -2825,6 +3038,7 @@ export default function Home() {
     return [
       `Tenant Name: ${record.fullName}`,
       `Phone Number: ${record.phoneNumber || "Not recorded"}`,
+      `Tenant Type: ${record.tenantType || "Not recorded"}`,
       `Age: ${record.age || "Not recorded"}`,
       `Date of Birth: ${record.dateOfBirth || "Not recorded"}`,
       `Family Members Below Age 10: ${record.familyMembersBelow10 || "0"}`,
@@ -2965,7 +3179,9 @@ export default function Home() {
     if (
       "sdDocumentPaths" in record &&
       record.sdDocumentPaths &&
-      (viewerModule === "HB Claims Team" || viewerModule === "RMS Team")
+      (viewerModule === "HB Claims Team" ||
+        viewerModule === "RMS Team" ||
+        viewerModule === "Referral Officer")
     ) {
       record.sdDocumentPaths.forEach((path, index) => {
         if (path) {
@@ -3070,6 +3286,102 @@ export default function Home() {
     }
 
     return items;
+  }
+
+  function countReferralOfficerSdProgress(record: TeamReferralRecord) {
+    const savedPaths = record.sdDocumentPaths ?? [];
+    const picked = sdDocumentFiles[record.id] ?? [];
+    return BACK_FILLING_SLOT_INDICES.reduce((count, slotIndex) => {
+      if (picked[slotIndex] || savedPaths[slotIndex]) {
+        return count + 1;
+      }
+      return count;
+    }, 0);
+  }
+
+  async function saveReferralOfficerDocumentProgress(record: TeamReferralRecord) {
+    const picked = sdDocumentFiles[record.id] ?? [];
+    const savedPaths = record.sdDocumentPaths ?? [];
+    const hasNewFiles = BACK_FILLING_SLOT_INDICES.some(
+      (slotIndex) => picked[slotIndex],
+    );
+
+    if (!hasNewFiles) {
+      toast.message("Nothing new to save", {
+        description:
+          "Select a file for at least one supporting document, then save progress.",
+      });
+      return;
+    }
+
+    setSdUploading((prev) => ({ ...prev, [record.id]: true }));
+    try {
+      const mergedPaths: string[] = [];
+      for (let i = 0; i < SD_SLOT_COUNT; i++) {
+        mergedPaths.push(savedPaths[i] ?? "");
+      }
+
+      for (const slotIndex of BACK_FILLING_SLOT_INDICES) {
+        const fresh = picked[slotIndex];
+        if (fresh) {
+          const path = await uploadOne(
+            "sd-documents",
+            ["referral", record.id, SD_SLOTS[slotIndex].code],
+            fresh,
+          );
+          mergedPaths[slotIndex] = path;
+        }
+      }
+
+      const updated: TeamReferralRecord = {
+        ...record,
+        sdDocumentPaths: mergedPaths,
+      };
+
+      await saveReferralRecord(updated);
+
+      setTeamNewReferrals((queues) => ({
+        ...queues,
+        "Referral Officer": (queues["Referral Officer"] ?? []).map((item) =>
+          item.id === record.id ? updated : item,
+        ),
+      }));
+
+      setDriverQueue((records) =>
+        records.map((item) =>
+          item.id === record.id ? { ...item, sdDocumentPaths: mergedPaths } : item,
+        ),
+      );
+
+      if (selectedHistoryDetail?.id === record.id) {
+        setSelectedHistoryDetail(updated);
+      }
+
+      setSdDocumentFiles((prev) => {
+        const next = { ...prev };
+        const slots = [...(next[record.id] ?? Array(SD_SLOT_COUNT).fill(null))];
+        BACK_FILLING_SLOT_INDICES.forEach((slotIndex) => {
+          if (slots[slotIndex]) {
+            slots[slotIndex] = null;
+          }
+        });
+        next[record.id] = slots;
+        return next;
+      });
+
+      const savedCount = countReferralOfficerSdProgress(updated);
+      toast.success("Progress saved", {
+        description: `${savedCount} of ${BACK_FILLING_SLOT_INDICES.length} supporting documents on file. You can add the rest later.`,
+      });
+    } catch (uploadError) {
+      const message =
+        uploadError instanceof Error
+          ? uploadError.message
+          : String(uploadError);
+      toast.error("Could not save progress", { description: message });
+    } finally {
+      setSdUploading((prev) => ({ ...prev, [record.id]: false }));
+    }
   }
 
   async function completeTeamReferral(
@@ -4243,33 +4555,47 @@ export default function Home() {
     });
   }
 
-  async function uploadIntakeFiles(recordId: number) {
-    const updates: Partial<ReferralRecord> = {};
+  async function uploadIntakeFiles(
+    recordId: number,
+    files: {
+      idPhoto: File | null;
+      proofOfIncome: File | null;
+    },
+    existing?: Pick<ReferralRecord, "idPhotoPath" | "proofOfIncomePath">,
+  ): Promise<Pick<ReferralRecord, "idPhotoPath" | "proofOfIncomePath">> {
+    const paths: Pick<ReferralRecord, "idPhotoPath" | "proofOfIncomePath"> = {
+      idPhotoPath: existing?.idPhotoPath,
+      proofOfIncomePath: existing?.proofOfIncomePath,
+    };
+
     const tasks: Promise<void>[] = [];
 
-    if (idPhotoFile) {
+    if (files.idPhoto) {
       tasks.push(
-        uploadOne("referral-documents", ["referrals", recordId, "id"], idPhotoFile)
-          .then((path) => {
-            updates.idPhotoPath = path;
-          }),
+        uploadOne(
+          "referral-documents",
+          ["referrals", recordId, "id"],
+          files.idPhoto,
+        ).then((path) => {
+          paths.idPhotoPath = path;
+        }),
       );
     }
 
-    if (proofOfIncomeFile) {
+    if (files.proofOfIncome) {
       tasks.push(
         uploadOne(
           "referral-documents",
           ["referrals", recordId, "proof-of-income"],
-          proofOfIncomeFile,
+          files.proofOfIncome,
         ).then((path) => {
-          updates.proofOfIncomePath = path;
+          paths.proofOfIncomePath = path;
         }),
       );
     }
 
     if (tasks.length === 0) {
-      return updates;
+      return paths;
     }
 
     setIntakeUploading(true);
@@ -4281,11 +4607,12 @@ export default function Home() {
         description:
           error instanceof Error ? error.message : "Please try again.",
       });
+      throw error;
     } finally {
       setIntakeUploading(false);
     }
 
-    return updates;
+    return paths;
   }
 
   async function savePassedReferralOfficer() {
@@ -4319,8 +4646,24 @@ export default function Home() {
   async function handleReferralSubmit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
 
+    const existingFollowUp =
+      editingFollowUpId != null
+        ? followUps.find((record) => record.id === editingFollowUpId)
+        : undefined;
+
     if (referralStep < totalReferralSteps) {
       if (referralStep === 2) {
+        const phoneCheck = validateUkPhoneNumber(phoneNumber);
+        if (!phoneCheck.valid) {
+          setPhoneNumberError(phoneCheck.message);
+          toast.error("Invalid phone number", {
+            description: phoneCheck.message,
+          });
+          return;
+        }
+        setPhoneNumberError(null);
+        setPhoneNumber(phoneCheck.display);
+
         if (!tenantType.trim()) {
           toast.error("Tenant type is required", {
             description: "Please choose Single or Family before continuing.",
@@ -4339,13 +4682,29 @@ export default function Home() {
           return;
         }
       }
+
+      if (existingFollowUp) {
+        await persistFollowUpDraft(existingFollowUp);
+      }
+
       setReferralStep((currentStep) => currentStep + 1);
       setEligibilityResult(null);
       return;
     }
 
-    const failureReasons = [];
-    const documentFailureReasons = [];
+    const failureReasons: string[] = [];
+    const documentFailureReasons: string[] = [];
+
+    const phoneCheck = validateUkPhoneNumber(phoneNumber);
+    if (!phoneCheck.valid) {
+      setPhoneNumberError(phoneCheck.message);
+      toast.error("Invalid phone number", {
+        description: phoneCheck.message,
+      });
+      return;
+    }
+    setPhoneNumberError(null);
+    setPhoneNumber(phoneCheck.display);
 
     const ageNum = age !== "" ? Number(age) : NaN;
     if (!Number.isNaN(ageNum) && ageNum < 18) {
@@ -4364,15 +4723,45 @@ export default function Home() {
       documentFailureReasons.push(reason);
     }
 
+    if (!idPhotoFile && !existingFollowUp?.idPhotoPath) {
+      const reason = "SD-10.1 Tenant ID is required.";
+      failureReasons.push(reason);
+      documentFailureReasons.push(reason);
+    }
+
+    if (!proofOfIncomeFile && !existingFollowUp?.proofOfIncomePath) {
+      const reason = "Proof of income document is required.";
+      failureReasons.push(reason);
+      documentFailureReasons.push(reason);
+    }
+
+    const intakeFilesSnapshot = {
+      idPhoto: idPhotoFile,
+      proofOfIncome: proofOfIncomeFile,
+    };
+
+    async function mergeUploaded(record: ReferralRecord) {
+      const paths = await uploadIntakeFiles(record.id, intakeFilesSnapshot, {
+        idPhotoPath: record.idPhotoPath,
+        proofOfIncomePath: record.proofOfIncomePath,
+      });
+      return { ...record, ...paths };
+    }
+
     if (failureReasons.length === 0) {
-      let record = createReferralRecord("driver", []);
-      const uploaded = await uploadIntakeFiles(record.id);
-      record = { ...record, ...uploaded };
+      let record = buildReferralRecordFromForm("driver", [], existingFollowUp);
+      try {
+        record = await mergeUploaded(record);
+      } catch {
+        return;
+      }
+      clearReferralFileInputs();
       setFollowUps((records) =>
         records.filter((followUp) => followUp.id !== editingFollowUpId),
       );
       setDriverQueue((records) => [record, ...records]);
       void saveReferralRecord(record);
+      setEditingFollowUpId(null);
       setPassedReferralOfficer(
         referralType === "sourced" && referralOfficer ? referralOfficer : "",
       );
@@ -4387,15 +4776,24 @@ export default function Home() {
       return;
     }
 
-    if (editingFollowUpId) {
-      let record = createReferralRecord("failed", failureReasons);
-      const uploaded = await uploadIntakeFiles(record.id);
-      record = { ...record, ...uploaded };
+    if (editingFollowUpId && existingFollowUp) {
+      let record = buildReferralRecordFromForm(
+        "failed",
+        failureReasons,
+        existingFollowUp,
+      );
+      try {
+        record = await mergeUploaded(record);
+      } catch {
+        return;
+      }
+      clearReferralFileInputs();
       setFollowUps((records) =>
         records.filter((followUp) => followUp.id !== editingFollowUpId),
       );
-      setHistory((records) => [record, ...records]);
+      setHistory((records) => sortHistoryByNewestFirst([record, ...records]));
       void saveReferralRecord(record);
+      setEditingFollowUpId(null);
       setEligibilityResult({
         status: "failed",
         reasons: failureReasons,
@@ -4410,25 +4808,40 @@ export default function Home() {
       documentFailureReasons.length > 0 &&
       !failureReasons.includes("Age must be 18 or over.")
     ) {
-      let record = createReferralRecord("follow-up", documentFailureReasons);
-      const uploaded = await uploadIntakeFiles(record.id);
-      record = { ...record, ...uploaded };
-      setFollowUps((records) => [record, ...records]);
+      let record = buildReferralRecordFromForm(
+        "follow-up",
+        documentFailureReasons,
+        existingFollowUp,
+      );
+      try {
+        record = await mergeUploaded(record);
+      } catch {
+        return;
+      }
+      clearReferralFileInputs();
+      setFollowUps((records) => {
+        const without = records.filter((followUp) => followUp.id !== record.id);
+        return sortHistoryByNewestFirst([record, ...without]);
+      });
       void saveReferralRecord(record);
       setEligibilityResult({
         status: "follow-up",
         reasons: documentFailureReasons,
         title: "Moved to Follow ups",
         message:
-          "This referral needs NI Number or proof of income follow-up. Two reminders have been scheduled every 2 days.",
+          "This referral needs NI Number or proof of income follow-up. Two reminders are scheduled on days 2 and 4. If documents are not received by the deadline, the referral is cancelled automatically.",
       });
       return;
     }
 
-    let record = createReferralRecord("failed", failureReasons);
-    const uploaded = await uploadIntakeFiles(record.id);
-    record = { ...record, ...uploaded };
-    setHistory((records) => [record, ...records]);
+    let record = buildReferralRecordFromForm("failed", failureReasons, existingFollowUp);
+    try {
+      record = await mergeUploaded(record);
+    } catch {
+      return;
+    }
+    clearReferralFileInputs();
+    setHistory((records) => sortHistoryByNewestFirst([record, ...records]));
     void saveReferralRecord(record);
     setEligibilityResult({
       status: "failed",
@@ -5528,13 +5941,13 @@ export default function Home() {
               ).length === 0 ? (
                 <p className="empty-records">No referral officer history yet.</p>
               ) : (
-                history
-                  .filter(
+                sortHistoryByNewestFirst(
+                  history.filter(
                     (record) =>
                       record.status === "secured" ||
                       record.status === "viewing-ended",
-                  )
-                  .map((record) => (
+                  ),
+                ).map((record) => (
                     <button
                       className="history-row"
                       key={record.id}
@@ -5788,8 +6201,8 @@ export default function Home() {
                   ).length === 0 ? (
                     <p className="empty-records">No transfer history yet.</p>
                   ) : (
-                    supportTransferHistory
-                      .filter((record) =>
+                    sortHistoryByNewestFirst(
+                      supportTransferHistory.filter((record) =>
                         matchesBoardSearch(
                           `support-history-${selectedSupportHistoryAction?.toLowerCase() ?? "all"}`,
                           record.name,
@@ -5799,8 +6212,8 @@ export default function Home() {
                           record.newRoomNumber,
                           record.transferDate,
                         ),
-                      )
-                      .map((record) => (
+                      ),
+                    ).map((record) => (
                       <button
                         className="history-row"
                         key={record.id}
@@ -5824,8 +6237,8 @@ export default function Home() {
                   ).length === 0 ? (
                   <p className="empty-records">No leaver history yet.</p>
                 ) : (
-                  supportLeaverHistory
-                    .filter((record) =>
+                  sortHistoryByNewestFirst(
+                    supportLeaverHistory.filter((record) =>
                       matchesBoardSearch(
                         `support-history-${selectedSupportHistoryAction?.toLowerCase() ?? "all"}`,
                         record.name,
@@ -5833,8 +6246,8 @@ export default function Home() {
                         record.roomNumber,
                         record.leavingDate,
                       ),
-                    )
-                    .map((record) => (
+                    ),
+                  ).map((record) => (
                     <button
                       className="history-row"
                       key={record.id}
@@ -6033,7 +6446,7 @@ export default function Home() {
               </h2>
               <p>
                 {isReferralOfficer
-                  ? "Complete back filling for referrals after property assignment."
+                  ? "Upload supporting documents in any order. Save progress to keep partial uploads, then finish when every slot is complete."
                   : "Secured property referrals from Referral Officer appear here with tenant details and document placeholders."}
               </p>
             </div>
@@ -6154,11 +6567,30 @@ export default function Home() {
                             <small>
                               All {BACK_FILLING_SLOT_INDICES.length} are
                               required before back filling can be completed.
+                              Use Save progress after each upload batch.
                               {" "}
                               {filledCount}/{BACK_FILLING_SLOT_INDICES.length}
                               {" "}ready.
                             </small>
                           </div>
+                          {savedPaths.some((path, index) =>
+                            BACK_FILLING_SLOT_INDICES.includes(index) && path,
+                          ) && (
+                            <RecordMediaGallery
+                              items={getRecordMediaItems(
+                                selectedHistoryDetail,
+                                "Referral Officer",
+                              ).filter((item) =>
+                                BACK_FILLING_SLOT_INDICES.some(
+                                  (slotIndex) =>
+                                    item.label?.startsWith(
+                                      SD_SLOTS[slotIndex].code,
+                                    ),
+                                ),
+                              )}
+                              title="Saved supporting documents"
+                            />
+                          )}
                           <div className="sd-documents-list">
                             {BACK_FILLING_SLOT_INDICES.map((slotIndex) => {
                               const slot = SD_SLOTS[slotIndex];
@@ -6235,12 +6667,29 @@ export default function Home() {
                         (slotIndex) =>
                           picked[slotIndex] || savedPaths[slotIndex],
                       );
+                      const hasNewFiles = BACK_FILLING_SLOT_INDICES.some(
+                        (slotIndex) => picked[slotIndex],
+                      );
                       const isSdUploading =
                         sdUploading[selectedHistoryDetail.id] ?? false;
                       const uploadedDisabled =
                         isRO && (!allSdReady || isSdUploading);
                       return (
                     <div className="driver-actions">
+                      {isRO && (
+                        <button
+                          className="secondary-button dark-secondary-button"
+                          disabled={isSdUploading || !hasNewFiles}
+                          onClick={() =>
+                            void saveReferralOfficerDocumentProgress(
+                              selectedHistoryDetail,
+                            )
+                          }
+                          type="button"
+                        >
+                          {isSdUploading ? "Saving…" : "Save progress"}
+                        </button>
+                      )}
                       <button
                         className="submit-button compact-button"
                         disabled={uploadedDisabled}
@@ -6439,17 +6888,18 @@ export default function Home() {
                   0 ? (
                     <p className="empty-records">No leaver history yet.</p>
                   ) : (
-                    (teamLeaverHistory[selectedModule ?? ""] ?? [])
-                      .filter((record) =>
-                        matchesBoardSearch(
-                          `processing-history-${selectedProcessingHistoryAction?.toLowerCase() ?? "all"}`,
-                          record.name,
-                          record.propertyAddress,
-                          record.roomNumber,
-                          record.leavingDate,
-                        ),
-                      )
-                      .map((record) => (
+                    sortHistoryByNewestFirst(
+                      (teamLeaverHistory[selectedModule ?? ""] ?? []).filter(
+                        (record) =>
+                          matchesBoardSearch(
+                            `processing-history-${selectedProcessingHistoryAction?.toLowerCase() ?? "all"}`,
+                            record.name,
+                            record.propertyAddress,
+                            record.roomNumber,
+                            record.leavingDate,
+                          ),
+                      ),
+                    ).map((record) => (
                         <button
                           className="history-row"
                           key={record.id}
@@ -6469,19 +6919,20 @@ export default function Home() {
                   0 ? (
                     <p className="empty-records">No transfer history yet.</p>
                   ) : (
-                    (teamTransferHistory[selectedModule ?? ""] ?? [])
-                      .filter((record) =>
-                        matchesBoardSearch(
-                          `processing-history-${selectedProcessingHistoryAction?.toLowerCase() ?? "all"}`,
-                          record.name,
-                          record.currentProperty,
-                          record.currentRoomNumber,
-                          record.newPropertyAddress,
-                          record.newRoomNumber,
-                          record.transferDate,
-                        ),
-                      )
-                      .map((record) => (
+                    sortHistoryByNewestFirst(
+                      (teamTransferHistory[selectedModule ?? ""] ?? []).filter(
+                        (record) =>
+                          matchesBoardSearch(
+                            `processing-history-${selectedProcessingHistoryAction?.toLowerCase() ?? "all"}`,
+                            record.name,
+                            record.currentProperty,
+                            record.currentRoomNumber,
+                            record.newPropertyAddress,
+                            record.newRoomNumber,
+                            record.transferDate,
+                          ),
+                      ),
+                    ).map((record) => (
                         <button
                           className="history-row"
                           key={record.id}
@@ -6497,8 +6948,8 @@ export default function Home() {
                 ) : (teamHistory[selectedModule ?? ""] ?? []).length === 0 ? (
                   <p className="empty-records">No new referral history yet.</p>
                 ) : (
-                  (teamHistory[selectedModule ?? ""] ?? [])
-                    .filter((record) =>
+                  sortHistoryByNewestFirst(
+                    (teamHistory[selectedModule ?? ""] ?? []).filter((record) =>
                       matchesBoardSearch(
                         `processing-history-${selectedProcessingHistoryAction?.toLowerCase() ?? "all"}`,
                         record.fullName,
@@ -6507,8 +6958,8 @@ export default function Home() {
                         record.department,
                         record.teamOutcome,
                       ),
-                    )
-                    .map((record) => (
+                    ),
+                  ).map((record) => (
                       <button
                         className="history-row"
                         key={record.id}
@@ -8742,16 +9193,16 @@ export default function Home() {
               ).length === 0 ? (
                 <p className="empty-records">No completed inspections yet.</p>
               ) : (
-                inspectorHistory
-                  .filter((record) =>
+                sortHistoryByNewestFirst(
+                  inspectorHistory.filter((record) =>
                     matchesBoardSearch(
                       "inspector-history",
                       record.name,
                       inspectionPropertyAddress(record),
                       inspectionRoomNumber(record),
                     ),
-                  )
-                  .map((record) => (
+                  ),
+                ).map((record) => (
                     <button
                       className="history-row"
                       key={`inspector-history-${record.id}`}
@@ -8825,37 +9276,82 @@ export default function Home() {
             <div className="records-heading">
               <h2>Follow ups</h2>
               <p>
-                Referrals missing NI Number or proof of income. Reminders are
-                scheduled every 2 days, 2 times.
+                Referrals missing documents. Reminders run on days 2 and 4.
+                After the deadline, unanswered follow-ups are cancelled
+                automatically.
               </p>
             </div>
             <div className="records-list">
               {followUps.length === 0 ? (
                 <p className="empty-records">No follow ups yet.</p>
               ) : (
-                followUps.map((record) => (
-                  <article className="record-card" key={record.id}>
-                    <div>
-                      <span className="record-status follow-up">Follow up</span>
-                      <h3>{record.fullName}</h3>
-                      <p>{record.reasons.join(" ")}</p>
-                    </div>
-                    <div className="reminder-list">
-                      {getReminderDates(record.createdAt).map((date, index) => (
-                        <span key={date.toISOString()}>
-                          Reminder {index + 1}: {formatDisplayDate(date)}
-                        </span>
-                      ))}
-                    </div>
-                    <button
-                      className="submit-button compact-button"
-                      onClick={() => openFollowUpForEdit(record)}
-                      type="button"
-                    >
-                      Edit form
-                    </button>
-                  </article>
-                ))
+                sortHistoryByNewestFirst(followUps).map((record) => {
+                  const deadline = getFollowUpDeadline(record.createdAt);
+                  const deadlinePassed = isFollowUpDeadlinePassed(
+                    record.createdAt,
+                  );
+                  const documentsPending = isFollowUpDocumentsPending(record);
+
+                  return (
+                    <article className="record-card" key={record.id}>
+                      <div>
+                        <span className="record-status follow-up">Follow up</span>
+                        <h3>{record.fullName}</h3>
+                        <p>
+                          {record.reasons.length > 0
+                            ? record.reasons.join(" ")
+                            : "Documents still required."}
+                        </p>
+                        <small>
+                          Deadline: {formatDisplayDate(deadline)}
+                          {deadlinePassed ? " (passed)" : ""}
+                        </small>
+                      </div>
+                      <ul className="follow-up-checklist" role="list">
+                        <li className={record.niNumber?.trim() ? "done" : "pending"}>
+                          NI number {record.niNumber?.trim() ? "saved" : "missing"}
+                        </li>
+                        <li
+                          className={
+                            Number(record.incomeAmount) > 0 ? "done" : "pending"
+                          }
+                        >
+                          Income amount{" "}
+                          {Number(record.incomeAmount) > 0 ? "saved" : "missing"}
+                        </li>
+                        <li className={record.idPhotoPath ? "done" : "pending"}>
+                          Tenant ID {record.idPhotoPath ? "uploaded" : "missing"}
+                        </li>
+                        <li
+                          className={record.proofOfIncomePath ? "done" : "pending"}
+                        >
+                          Proof of income{" "}
+                          {record.proofOfIncomePath ? "uploaded" : "missing"}
+                        </li>
+                      </ul>
+                      <div className="reminder-list">
+                        {getReminderDates(record.createdAt).map((date, index) => (
+                          <span key={date.toISOString()}>
+                            Reminder {index + 1}: {formatDisplayDate(date)}
+                          </span>
+                        ))}
+                      </div>
+                      {deadlinePassed && documentsPending && (
+                        <p className="field-hint field-hint-error">
+                          Deadline passed — this follow-up will be cancelled.
+                        </p>
+                      )}
+                      <button
+                        className="submit-button compact-button"
+                        disabled={deadlinePassed && documentsPending}
+                        onClick={() => openFollowUpForEdit(record)}
+                        type="button"
+                      >
+                        Continue follow up
+                      </button>
+                    </article>
+                  );
+                })
               )}
             </div>
           </section>
@@ -8905,7 +9401,7 @@ export default function Home() {
               {history.length === 0 ? (
                 <p className="empty-records">No history yet.</p>
               ) : (
-                history.map((record) => (
+                sortHistoryByNewestFirst(history).map((record) => (
                   <button
                     className="history-row"
                     key={record.id}
@@ -8963,6 +9459,69 @@ export default function Home() {
               </div>
               <p>* Mandatory</p>
             </div>
+
+            {editingFollowUpRecord && (
+              <section className="follow-up-review history-detail">
+                <div>
+                  <span className="record-status follow-up">Saved follow up</span>
+                  <h3>{editingFollowUpRecord.fullName}</h3>
+                  <small>
+                    Created {formatDisplayDate(editingFollowUpRecord.createdAt)}{" "}
+                    · Deadline{" "}
+                    {formatDisplayDate(
+                      getFollowUpDeadline(editingFollowUpRecord.createdAt),
+                    )}
+                  </small>
+                </div>
+                <textarea
+                  readOnly
+                  rows={8}
+                  value={formatFullHistoryDetails(editingFollowUpRecord)}
+                />
+                {getRecordMediaItems(editingFollowUpRecord).length > 0 ? (
+                  <RecordMediaGallery
+                    items={getRecordMediaItems(editingFollowUpRecord)}
+                    title="Uploaded documents"
+                  />
+                ) : (
+                  <p className="empty-records">
+                    No documents uploaded yet. Add missing files below.
+                  </p>
+                )}
+                <ul className="follow-up-checklist" role="list">
+                  <li
+                    className={
+                      editingFollowUpRecord.niNumber?.trim() ? "done" : "pending"
+                    }
+                  >
+                    NI number
+                  </li>
+                  <li
+                    className={
+                      Number(editingFollowUpRecord.incomeAmount) > 0
+                        ? "done"
+                        : "pending"
+                    }
+                  >
+                    Income amount
+                  </li>
+                  <li
+                    className={
+                      editingFollowUpRecord.idPhotoPath ? "done" : "pending"
+                    }
+                  >
+                    Tenant ID photo
+                  </li>
+                  <li
+                    className={
+                      editingFollowUpRecord.proofOfIncomePath ? "done" : "pending"
+                    }
+                  >
+                    Proof of income
+                  </li>
+                </ul>
+              </section>
+            )}
 
             {referralStep === 1 && (
               <section className="form-section">
@@ -9045,15 +9604,43 @@ export default function Home() {
                     />
                   </label>
 
-                  <label className="field">
+                  <label
+                    className={`field${phoneNumberError ? " field-invalid" : ""}`}
+                  >
                     <span>Phone Number *</span>
                     <input
-                      onChange={(event) => setPhoneNumber(event.target.value)}
-                      placeholder="Enter phone number"
+                      aria-invalid={phoneNumberError ? true : undefined}
+                      autoComplete="tel"
+                      inputMode="tel"
+                      onBlur={() => {
+                        const result = validateUkPhoneNumber(phoneNumber);
+                        if (!result.valid) {
+                          setPhoneNumberError(result.message);
+                          return;
+                        }
+                        setPhoneNumberError(null);
+                        setPhoneNumber(result.display);
+                      }}
+                      onChange={(event) => {
+                        setPhoneNumber(event.target.value);
+                        if (phoneNumberError) {
+                          setPhoneNumberError(null);
+                        }
+                      }}
+                      placeholder="e.g. 07XXX XXXXXX or +44 7XXX XXXXXX"
                       required
                       type="tel"
                       value={phoneNumber}
                     />
+                    {phoneNumberError ? (
+                      <small className="field-hint field-hint-error">
+                        {phoneNumberError}
+                      </small>
+                    ) : (
+                      <small className="field-hint">
+                        UK mobile or landline only
+                      </small>
+                    )}
                   </label>
 
                   <label className="field">
@@ -9163,20 +9750,26 @@ export default function Home() {
                   </label>
 
                   <label className="field file-field">
-                    <span>SD-10.1 Tenant ID *</span>
+                    <span>
+                      SD-10.1 Tenant ID *
+                      {editingFollowUpRecord?.idPhotoPath ? " (on file)" : ""}
+                    </span>
                     <input
-                      accept="image/*"
+                      accept="image/*,.pdf"
                       capture="environment"
+                      key={`referral-id-photo-${referralFileInputKey}`}
                       onChange={(event) =>
                         setIdPhotoFile(event.target.files?.[0] ?? null)
                       }
-                      required
+                      required={!editingFollowUpRecord?.idPhotoPath}
                       type="file"
                     />
                     <small>
                       {idPhotoFile
                         ? `Selected: ${idPhotoFile.name}`
-                        : "Use the camera to take a photo of the tenant ID."}
+                        : editingFollowUpRecord?.idPhotoPath
+                          ? "Already uploaded — choose a new file only to replace it."
+                          : "Use the camera to take a photo of the tenant ID."}
                     </small>
                   </label>
 
@@ -9213,18 +9806,23 @@ export default function Home() {
                         : "Upload proof of income picture"}
                     </span>
                     <input
-                      accept="image/*"
+                      accept="image/*,.pdf"
                       capture={
                         proofMethod === "camera" ? "environment" : undefined
                       }
+                      key={`referral-proof-${referralFileInputKey}`}
                       onChange={(event) =>
                         setProofOfIncomeFile(event.target.files?.[0] ?? null)
                       }
                       type="file"
                     />
-                    {proofOfIncomeFile && (
-                      <small>Selected: {proofOfIncomeFile.name}</small>
-                    )}
+                    <small>
+                      {proofOfIncomeFile
+                        ? `Selected: ${proofOfIncomeFile.name}`
+                        : editingFollowUpRecord?.proofOfIncomePath
+                          ? "Proof of income already uploaded — choose a new file only to replace it."
+                          : "Upload or take a photo of proof of income."}
+                    </small>
                   </label>
 
                   <label className="field">
